@@ -104,6 +104,9 @@ Datetime` is a plain string, needs parsing.
 
 ### patient_medications.csv — medication orders + MAR records
 
+MAR = Medication Administration Record (the log of actual administration events for an
+order, as distinct from the order itself — see `MAR_ACTION_NM` below).
+
 18 real columns (+ `_source_file`/`_ingested_at` provenance). **27,961,524 rows, 65,742
 distinct `LOG_ID`s, ~425 rows/encounter** (full population, not sample-based) — dense
 MAR-style sequential administration data. Strong candidate for medication-*sequence*
