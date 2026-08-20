@@ -1,4 +1,4 @@
-# Mover
+# Mover Laboratory
 
 Building an Apache Iceberg data lake from the [MOVER](https://mover.ics.uci.edu/) (Medical
 Informatics Operating Room Vitals and Events Repository) dataset — de-identified Epic EMR
