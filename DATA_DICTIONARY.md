@@ -1,8 +1,9 @@
 # Mover Data Dictionary & Ingestion Notes
 
 Living document. Update this whenever a table gets ingested, a column's meaning/type
-is clarified, or a data quality issue is found. See `MOVER_ICEBERG_HANDOFF.md` for the
-original project scoping doc (historical — this file supersedes it for schema facts).
+is clarified, or a data quality issue is found. See `README.md` for the project overview,
+data source locations, and tooling/container docs, and `BUILD_LOG.md` for the project-wide
+build/experiment log (this file's "Ingestion log" below is the data-specific slice of it).
 
 Official source data dictionary (per-table column definitions):
 https://mover.ics.uci.edu/documentation.html
@@ -25,13 +26,16 @@ compiled binaries (e.g. pyarrow's DLLs) and can only be disabled permanently (ne
 this). Everything runs in an isolated Docker image instead, deliberately kept separate
 from the user's existing `Ubuntu-22.04` WSL distro (actively used for other projects).
 
-- `Dockerfile` (project root) → image `mover-iceberg:latest`. `python:3.12-slim` base +
-  `pyiceberg[sql-sqlite,pyarrow]`, `duckdb`, `pandas`, `pyarrow`, `dask[dataframe]`.
-- Build: `docker build -t mover-iceberg:latest .`
+- `Dockerfile` (project root) → image `mover-laboratory:latest` (renamed from
+  `mover-iceberg` once it was confirmed to serve ingestion, EDA, and network-serving
+  roles — see `BUILD_LOG.md`). `python:3.12-slim` base + `pyiceberg[sql-sqlite,pyarrow]`,
+  `duckdb`, `pandas`, `pyarrow`, `dask[dataframe]`.
+- Build: `docker build -t mover-laboratory:latest .`
 - Run with the project mounted (data never gets baked into the image):
-  `docker run --rm -v "/d/Data_Science_Projects/Mover:/work" mover-iceberg:latest <cmd>`
+  `docker run --rm -v "/d/Data_Science_Projects/Mover:/work" mover-laboratory:latest <cmd>`
   (from Git Bash, prefix with `MSYS_NO_PATHCONV=1` so `/work` isn't mangled into a
-  Windows path).
+  Windows path). The warehouse itself now lives in a separate `mover-warehouse` Docker
+  volume, not under `/work` on the host — see `README.md` → "Data sources".
 - No GPU in this image — ingestion is I/O-bound, doesn't need it. A separate image
   extending `pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel` (CUDA 12.8, matches the
   RTX 5090 laptop GPU, already pulled locally) will be built when we reach ML training.

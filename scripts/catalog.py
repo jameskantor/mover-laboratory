@@ -1,12 +1,20 @@
+import os
 from pathlib import Path
 from pyiceberg.catalog.sql import SqlCatalog
 
-# Data written under this path (via the /D:/... symlink created by entrypoint.sh) ends
-# up with baked-in Iceberg manifest paths that resolve correctly both inside the
-# container (/work/...) and natively on Windows (D:/Data_Science_Projects/Mover/...,
-# once DuckDB strips the single leading "/" it always strips on Windows). See
-# entrypoint.sh and DATA_DICTIONARY.md for the full explanation.
-WAREHOUSE_DIR = Path("/D:/Data_Science_Projects/Mover/iceberg_warehouse")
+# Portable by default: the warehouse lives under /work (wherever the caller bind-mounts
+# their own data), with no assumption about host OS or folder layout, so this works
+# unmodified for anyone who clones the repo and points it at their own MOVER download.
+#
+# Set MOVER_WAREHOUSE_DIR to opt into the alternate mode this project actually runs in on
+# this machine: a path like /D:/Data_Science_Projects/Mover/iceberg_warehouse, paired with
+# entrypoint.sh symlinking that path to /work (via WINDOWS_HOST_PATH). Iceberg bakes
+# absolute warehouse paths into every manifest/snapshot file at write time, and native
+# Windows DuckDB (e.g. DBeaver) strips exactly one leading "/" and resolves the rest
+# relative to CWD -- so a warehouse path that isn't already a Windows-drive-letter path
+# once that slash is stripped is unreadable from Windows tools, regardless of mounts or
+# junctions. See DATA_DICTIONARY.md for the full history.
+WAREHOUSE_DIR = Path(os.environ.get("MOVER_WAREHOUSE_DIR", "/work/iceberg_warehouse"))
 # The catalog's own SQLite file doesn't get baked into any manifest, so it's fine (and
 # simpler) to keep it on the plain /work path rather than through the colon-path symlink.
 CATALOG_DB = Path("/work/iceberg_warehouse/catalog.db")

@@ -1,13 +1,12 @@
 #!/bin/sh
-# Iceberg bakes absolute warehouse paths into its manifest/snapshot files at write time.
-# DuckDB on native Windows only strips a single leading "/" and does not resolve
-# CWD-relative or drive-relative POSIX paths beyond that -- so any warehouse path that
-# doesn't already look like a Windows drive-letter path once that one slash is gone will
-# break when the same Iceberg tables are read from Windows (e.g. via DBeaver).
-#
-# Fix: make the warehouse path be exactly "/D:/Data_Science_Projects/Mover/..." inside
-# the container (via this symlink), so every baked-in reference is already a valid
-# Windows path once DuckDB strips the leading slash on read.
-mkdir -p "/D:/Data_Science_Projects"
-[ -L "/D:/Data_Science_Projects/Mover" ] || ln -s /work "/D:/Data_Science_Projects/Mover"
+# Optional: set WINDOWS_HOST_PATH (e.g. "D:/Data_Science_Projects/Mover") to make that
+# exact path resolve to /work inside the container. Only needed alongside
+# MOVER_WAREHOUSE_DIR when a warehouse under that path must stay readable from native
+# Windows DuckDB (e.g. DBeaver) -- see catalog.py for why. Portable setups that don't need
+# native-Windows access can skip this entirely; no symlink is created unless it's set.
+if [ -n "$WINDOWS_HOST_PATH" ]; then
+    parent_dir=$(dirname "/$WINDOWS_HOST_PATH")
+    mkdir -p "$parent_dir"
+    [ -L "/$WINDOWS_HOST_PATH" ] || ln -s /work "/$WINDOWS_HOST_PATH"
+fi
 exec "$@"

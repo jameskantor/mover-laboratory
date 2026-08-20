@@ -8,9 +8,11 @@ registered as a plain SQL view, so you can just write:
     con.sql("SELECT * FROM patient_labs LIMIT 10").show()
     con.sql("SELECT COUNT(*) FROM flowsheets").show()
 """
+import os
+
 import duckdb
 
-WAREHOUSE = "/D:/Data_Science_Projects/Mover/iceberg_warehouse/bronze"
+WAREHOUSE = os.environ.get("MOVER_WAREHOUSE_DIR", "/work/iceberg_warehouse") + "/bronze"
 TABLES = [
     "patient_information", "patient_history", "patient_visit", "patient_coding",
     "patient_post_op_complications", "patient_lda", "patient_procedure_events",
