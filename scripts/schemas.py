@@ -34,7 +34,7 @@ TABLES = {
             ("LOS", DoubleType(), False),
             ("ICU_ADMIN_FLAG", StringType(), False),
             ("SURGERY_DATE", TimestampType(), False),
-            ("BIRTH_DATE", LongType(), False),  # actually age in years, see DATA_DICTIONARY.md
+            ("BIRTH_DATE", LongType(), False),  # actually age in years, see docs/DATA_DICTIONARY.md
             ("HEIGHT", StringType(), False),  # raw ft/in text, parsed at silver
             ("WEIGHT", DoubleType(), False),  # ounces, EPIC dataset
             ("SEX", StringType(), False),

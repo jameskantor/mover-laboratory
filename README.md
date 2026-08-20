@@ -16,18 +16,18 @@ service. `.gitignore` already excludes CSVs, the Iceberg warehouse, and logs.
 own machine, their own credentialed MOVER download, the same containers and scripts. It
 does not ship data (the MOVER agreement doesn't allow that), only the tooling to rebuild
 it from your own access. For the story of how *we* built and are iterating on our own copy
-— experiments, benchmarks, bugs found and fixed — see `BUILD_LOG.md` instead.
+— experiments, benchmarks, bugs found and fixed — see `docs/BUILD_LOG.md` instead.
 
 ## Status
 
 **Bronze layer: done.** All 10 source tables are ingested into Iceberg and row-count-
 verified against the source CSVs. 1,502,559,444 rows total. The warehouse lives in a
 Docker-native volume (not a Windows-visible path) so it stays close to the compute that
-reads it — see `BUILD_LOG.md` for the benchmark that motivated this. Windows-side access
+reads it — see `docs/BUILD_LOG.md` for the benchmark that motivated this. Windows-side access
 is via `quack.ps1` (DuckDB's Quack remote protocol) — verified working from the native
 DuckDB CLI; DBeaver access via the same protocol is set up but pending final confirmation.
 
-**Silver / gold: not started.** See `DATA_DICTIONARY.md` → "Open items" for the specific
+**Silver / gold: not started.** See `docs/DATA_DICTIONARY.md` → "Open items" for the specific
 next steps (casing/unit fixes, then feature tables once an ML target is chosen).
 
 ## Data sources
@@ -39,7 +39,7 @@ next steps (casing/unit fixes, then feature tables once an ML target is chosen).
 | `mover-warehouse` (Docker-native volume, not a Windows path) | **The actual lake.** Bronze Iceberg tables (data + metadata), ~4.9GB (Parquet/ZSTD compressed). Lives in Docker's own storage for fast access from compute; reach it via `query.ps1` / `jupyter.ps1` / `quack.ps1`, not a Windows file path. |
 
 Column-level definitions, type-correction decisions, and the full ingestion log live in
-`DATA_DICTIONARY.md` — that file is the living reference for schema questions.
+`docs/DATA_DICTIONARY.md` — that file is the living reference for schema questions.
 
 ## Tools & containers
 
@@ -52,7 +52,7 @@ project's environment.
 |---|---|---|
 | **`mover-laboratory:latest`** | Built from project `Dockerfile` (`python:3.12-slim` + pyiceberg, duckdb, pandas, pyarrow, dask, jupyterlab) | One image, several roles: **ingestion** (`scripts/ingest.py`, resumable/idempotent), **EDA** (`query.ps1` / `jupyter.ps1`), and **serving** (`quack.ps1`, exposes the bronze tables over the network via Quack). Same dependency stack covers all three. |
 | **`pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel`** | Pulled, stock, **not yet customized** | Reserved for the ML training phase (GPU: RTX 5090 laptop). Has no pandas/pyarrow/duckdb yet — needs either its own Dockerfile layer adding those, or a plan to hand it pre-exported training data instead of reading Iceberg directly. |
-| **DBeaver CE** | `winget install --id 9PNKDR50694P --source msstore` (Store build — trusted by Smart App Control) | Query the warehouse from native Windows with a GUI, over the network via the `quack-jdbc` driver (alpha) — DBeaver has no direct file access to the warehouse anymore, since it isn't on a Windows path. See `BUILD_LOG.md` for setup (jar URL, driver class, connection string). |
+| **DBeaver CE** | `winget install --id 9PNKDR50694P --source msstore` (Store build — trusted by Smart App Control) | Query the warehouse from native Windows with a GUI, over the network via the `quack-jdbc` driver (alpha) — DBeaver has no direct file access to the warehouse anymore, since it isn't on a Windows path. See `docs/BUILD_LOG.md` for setup (jar URL, driver class, connection string). |
 | **DuckDB CLI** | `winget install --id DuckDB.cli` | Same warehouse, from a terminal, via `ATTACH '...' (TYPE quack)` or `quack_query(...)` — confirmed working. No Docker needed on this side. |
 
 ### Running things
@@ -65,7 +65,7 @@ project's environment.
 .\jupyter.ps1
 
 # Serve the bronze tables over the network (Quack, beta) for DBeaver / other DuckDB
-# clients on Windows -- see BUILD_LOG.md for the DBeaver driver setup
+# clients on Windows -- see docs/BUILD_LOG.md for the DBeaver driver setup
 .\quack.ps1
 
 # Re-run ingestion (idempotent — safe to re-run, tracks progress in
@@ -95,8 +95,10 @@ scripts/
   shell.py                     → what query.ps1 runs (DuckDB views over bronze)
   quack_server.py              → what quack.ps1 runs
   gen_dbeaver_sql.py           → regenerates scripts/dbeaver_setup.sql (legacy direct-file
-                                  DBeaver setup, superseded by quack.ps1 — see BUILD_LOG.md)
-DATA_DICTIONARY.md             → canonical column definitions + ingestion log
+                                  DBeaver setup, superseded by quack.ps1 — see docs/BUILD_LOG.md)
+docs/
+  DATA_DICTIONARY.md           → canonical column definitions + ingestion log
+  BUILD_LOG.md                 → our own build/experiment history (not the repro guide)
 EMR/                           → working CSV copy (gitignored)
 ```
 
@@ -117,7 +119,7 @@ superseded, safe to delete once you've confirmed the volume-backed setup end-to-
   not yet the documented pattern to recommend to others until it stabilizes.
 - No experiment tracking (MLflow/W&B) set up yet — needed before the ML phase.
 - Single copy of the data outside G: — no offsite/cloud backup.
-- See `DATA_DICTIONARY.md` → "Open items / TODO" for the data-pipeline-specific next
+- See `docs/DATA_DICTIONARY.md` → "Open items / TODO" for the data-pipeline-specific next
   steps (silver layer design, complication-label validation, gold feature tables).
 
 ## Development log
@@ -125,4 +127,4 @@ superseded, safe to delete once you've confirmed the volume-backed setup end-to-
 Everything above is what you need to stand this up yourself. This section isn't that —
 it's a pointer to our own build process on this particular machine: experiments,
 benchmarks, protocol research, and bugs hit and fixed along the way, in case the *why*
-behind a decision matters to you. See `BUILD_LOG.md`.
+behind a decision matters to you. See `docs/BUILD_LOG.md`.

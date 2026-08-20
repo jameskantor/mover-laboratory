@@ -13,7 +13,7 @@ from pyiceberg.catalog.sql import SqlCatalog
 # Windows DuckDB (e.g. DBeaver) strips exactly one leading "/" and resolves the rest
 # relative to CWD -- so a warehouse path that isn't already a Windows-drive-letter path
 # once that slash is stripped is unreadable from Windows tools, regardless of mounts or
-# junctions. See DATA_DICTIONARY.md for the full history.
+# junctions. See docs/DATA_DICTIONARY.md for the full history.
 WAREHOUSE_DIR = Path(os.environ.get("MOVER_WAREHOUSE_DIR", "/work/iceberg_warehouse"))
 # The catalog's own SQLite file doesn't get baked into any manifest, so it's fine (and
 # simpler) to keep it on the plain /work path rather than through the colon-path symlink.

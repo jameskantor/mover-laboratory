@@ -3,7 +3,7 @@ tools (DBeaver, or another DuckDB process) can query them over the network inste
 reading files directly -- the container is where the data and the query engine live.
 
 Quack is beta (shipped 2026-05-12, stabilizes with DuckDB v2.0 in Sept 2026): expect
-breaking changes. See BUILD_LOG.md for why this is a prototype, not yet "the" pattern.
+breaking changes. See docs/BUILD_LOG.md for why this is a prototype, not yet "the" pattern.
 
 Run with: docker run --rm -p 9494:9494 -v "${PWD}:/work" -v mover-warehouse:/work/iceberg_warehouse
     mover-laboratory:latest python /work/scripts/quack_server.py
