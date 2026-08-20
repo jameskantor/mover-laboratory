@@ -206,16 +206,26 @@ off the volume-backed warehouse.
 
 **DBeaver confirmed working** (2026-08-20, same session): registered the `quack-jdbc.jar`
 driver (class `com.gizmodata.quack.jdbc.sql.QuackDriver`) in DBeaver's Driver Manager,
-created a connection with URL `jdbc:quack://localhost:9494?token=mover-lab-dev-token`,
-Test Connection succeeded. One false alarm along the way — an "instance already running"
-error turned out to be the user starting a second Quack server (`quack.ps1`) while the
-first detached one (`mover-quack`) was still up, colliding on port 9494; not a Quack or
-driver problem, just two servers fighting over the same port.
+created a connection, Test Connection succeeded. One false alarm along the way — an
+"instance already running" error turned out to be the user starting a second Quack server
+(`quack.ps1`) while the first detached one (`mover-quack`) was still up, colliding on port
+9494; not a Quack or driver problem, just two servers fighting over the same port.
+
+**Follow-up bug: Database Navigator showed "No items" under Views**, even though the
+connection worked and SQL editor queries against it returned correct data. Root cause:
+the connection URL had no `{database}` segment (`jdbc:quack://localhost:9494?token=...`),
+and the tree was browsing a catalog named `mover` that doesn't exist server-side.
+Confirmed the real catalog/schema directly against the server:
+`SELECT current_catalog(), current_schema()` → `memory`, `main`; `SHOW DATABASES` → only
+`memory` exists. Fixed by adding the database segment to the URL:
+`jdbc:quack://localhost:9494/memory?token=mover-lab-dev-token` — tree populates
+correctly now. **Use this URL form, not the one without `/memory`, for any new DBeaver
+connection to this server.**
 
 **Result: the original ask from this whole thread of work is done.** Windows-side tools
-(native CLI, DBeaver) reach the data over the network; the data and the query engine both
-live in the container; nothing on the Windows side reads a warehouse file directly
-anymore.
+(native CLI, DBeaver) reach the data over the network, including the Database Navigator
+tree, not just ad hoc SQL; the data and the query engine both live in the container;
+nothing on the Windows side reads a warehouse file directly anymore.
 
 ## 2026-08-20 — Folded Quack into jupyter.ps1; cleaned up the redundant warehouse copy
 
