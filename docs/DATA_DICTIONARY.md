@@ -104,10 +104,53 @@ Datetime` is a plain string, needs parsing.
 
 ### patient_medications.csv — medication orders + MAR records
 
-18 columns. Sample of 200k rows collapses to just 6,628 unique `LOG_ID` / 4,751 unique
-`MRN` — like labs, very dense per encounter. `RECORD_TYPE` has 17,111 sample nulls (3
-values). `ADMIN_SIG` is float64 with 62,390 sample nulls. Good candidate for
-medication-sequence modeling (see project memory on candidate ML directions).
+18 real columns (+ `_source_file`/`_ingested_at` provenance). **27,961,524 rows, 65,742
+distinct `LOG_ID`s, ~425 rows/encounter** (full population, not sample-based) — dense
+MAR-style sequential administration data. Strong candidate for medication-*sequence*
+modeling, not flat per-surgery aggregation (see project memory on candidate ML
+directions).
+
+Column-by-column audit below went through every column against the official MOVER docs
+(`mover.ics.uci.edu/patient-meds.html`) and real data, reviewed with the user (clinical
+domain expertise) column by column — several corrections and open questions came out of
+that review that a docs-only pass would have missed.
+
+**Join key note:** `LOG_ID` here is the visit/admission/encounter number (not
+surgery-specific). Only 94.8% of this table's `LOG_ID`s (62,298 / 65,742) match
+`patient_information`, and 72.5% (47,660 / 65,742) match `patient_visit` — expected, not
+a data quality issue: `patient_information` is filtered to encounters with a captured
+surgical procedure, a narrower scope than "every encounter with a medication order."
+
+| Column | Source | Meaning | Status |
+|---|---|---|---|
+| `MRN` | docs | Patient ID | confirmed |
+| `LOG_ID` | docs (refined) | Visit/admission/encounter number — broader than "surgery," see join note above | confirmed |
+| `ENC_TYPE_C` / `ENC_TYPE_NM` | **undocumented**, inferred | Encounter type: `3`=Hospital Encounter (91%), `52`=Anesthesia (8.7%), rare Infusion Ctr Visit/Office Visit/Consultation/Nurse Only/Procedure Visit. `_C`/`_NM` is standard Epic Clarity naming (Category code / resolved Name) — `_C` is the only paired code column in this table | ⚠️ **investigate**: whether `ENC_TYPE_C` maps to Epic's standard/foundation category values (shared across Epic installations) rather than a UCI-specific code |
+| `ORDERING_DATE` | docs | When the order was placed | confirmed — verified `ORDERING_DATE ≤ START_DATE` holds 99.97% of rows (92.5% same-day, 7.5% ordered days ahead); 0.03% (9,656 rows) backwards, likely retroactive/backdated entry |
+| `ORDER_CLASS_NM` | docs | How the order was placed: Inpatient (~97%), ePrescribe, Normal, Security Rx Print (587 rows) | ⚠️ **investigate**: real-world relevance unclear — `Security Rx Print` may relate to restricted/controlled substances; needs Epic community forum research |
+| `MEDICATION_ID` | docs (**wrong**) | Docs claim "CPT code" — false. Values (99 to 99,999,204,200, inconsistent digit counts) don't fit CPT's fixed 5-digit format. Actually Epic's internal medication-master surrogate key, 3,960 distinct | ⚠️ **investigate**: whether hospital-specific (UCI-built formulary), Epic-specific (shared foundation medication master), or maps to an external med DB (FDB/Multum) — determines if this ID is usable outside this dataset |
+| `DISPLAY_NAME` | **undocumented**, inferred | The medication *order* string as entered — formulation/concentration/instructions as ordered (e.g. `"phenylephrine (NEO-SYNEPHRINE) 40 mg in sodium chloride 0.9% 250 mL infusion"`). 16,624 distinct. This is the order, not a record of what was actually delivered — actual administration is tracked separately via `MAR_ACTION_NM`/`MED_ACTION_TIME` | confirmed (order-level, not administration-level) |
+| `MEDICATION_NM` | docs | Internal formulary/order-set name, facility-specific (e.g. `(UCI)` suffix), 4,344 distinct | 🔶 **hypothesis, unconfirmed**: may represent the specific product/formulation as stocked/procured by the pharmacy (tied to manufacturer/packaging/NDC), vs. `DISPLAY_NAME`'s clinician-facing order description — needs investigation |
+| `START_DATE` / `END_DATE` | docs (**imprecise**) | Docs call `START_DATE` "when administered" — actually the **order-level** date range (date-only, midnight timestamps), not an administration event | confirmed via `ORDERING_DATE` check above |
+| `ORDER_STATUS_NM` | **undocumented**, inferred | Order lifecycle: Discontinued (91%), Completed, Dispensed, Verified, Sent, Canceled | ⚠️ **data quality + investigate**: 9,377 rows have a stray `"0 "` text prefix (`"0 Discontinued"` vs `"Discontinued"`, `"0 Dispensed"` vs `"Dispensed"`) — same shape as the known `ADMIN_SIG` `"0 NULL"` ingestion bug. Compare the two groups directly (other column values) before assuming it's pure export noise — could be clinically significant |
+| `RECORD_TYPE` | docs | preop/periop/postop, same pattern as elsewhere in the dataset | 🔶 **working hypothesis, not fully confirmed**: which phase of the encounter the order was prescribed and administered under |
+| `MAR_ACTION_NM` | **undocumented**, inferred | The administration-record action per row. Scheduled meds (e.g. "every 4h" orders): system auto-generates mandatory administration slots; each resolves to `Given` (actually administered — counts toward dose/exposure) vs. `Hold`/`MAR Hold` (acknowledged but not given — no exposure). Infusion meds: separate vocabulary — `Started`, `Stopped`, `Rate Verify` (a check/confirmation, not necessarily a change), `Rate Change` (actual adjustment), `New Bag` (fluid replacement) | ⚠️ **central open task**: classify every `MAR_ACTION_NM` value into "counts toward actual drug exposure" vs. "logistics/non-exposure event" — required before this table can correctly answer "what was this patient's actual medication exposure" |
+| `MED_ACTION_TIME` | **undocumented**, inferred | The real administration-action timestamp (actual time-of-day) — the correct clock for MAR events, unlike date-only `START_DATE`/`END_DATE` | confirmed |
+| `ADMIN_SIG` | docs | Dose administered, float. Known ingestion bug (malformed `"0 NULL"` value, fixed via automatic type coercion from schema) | ⚠️ **investigate**: meaning depends on `MAR_ACTION_NM`, not just "populated vs. null" — e.g. `Rate Verify` legitimately has no dose documented (pump-rate confirmation only, not a new dose event). Need a `MAR_ACTION_NM` → expected-`ADMIN_SIG`-behavior mapping |
+| `DOSE_UNIT_NM` | docs | Dose unit, paired with `ADMIN_SIG` | confirmed |
+| `MED_ROUTE_NM` | docs | Administration route | confirmed |
+
+Note: the official docs also mention a `SURGERY_DATE` column for this table — it does not
+exist in the actual source CSV (verified against the raw file header, ruling out an
+ingestion bug). Likely boilerplate carried over from `patient_information`'s docs page,
+which does have `SURGERY_DATE`.
+
+**Overarching open item, not yet resolved:** we do not yet have a complete, verified
+picture of exactly how this system documents medication administration end to end — the
+interplay between `MAR_ACTION_NM`, `ADMIN_SIG`, `START_DATE`/`END_DATE`, and
+`MED_ACTION_TIME` across scheduled vs. infusion medications needs systematic
+investigation before this table can be trusted for exposure/dose-based features. The
+per-row flags above are pieces of that larger question, not independent issues.
 
 ### patient_post_op_complications.csv — SmartData postop elements
 
