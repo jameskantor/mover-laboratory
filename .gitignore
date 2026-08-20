@@ -1,0 +1,19 @@
+# Clinical data - never commit, HIPAA-governed even when de-identified
+EMR/
+*.csv
+*.parquet
+
+# Iceberg warehouse (data + catalog)
+iceberg_warehouse/
+
+# Logs / ingestion status
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
