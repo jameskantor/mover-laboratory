@@ -19,3 +19,11 @@ WORKDIR /work
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
+
+# Default: launch the lab (JupyterLab + Quack server, see scripts/start_lab.sh) when no
+# command is given. query.ps1 and ingestion pass their own explicit command and override
+# this either way -- this only matters for a bare `docker run` with no args, so a new user
+# gets a working lab without needing to know jupyter.ps1's exact invocation first. Assumes
+# the project is mounted at /work, same as everything else in this image.
+EXPOSE 8888 9494
+CMD ["sh", "/work/scripts/start_lab.sh"]

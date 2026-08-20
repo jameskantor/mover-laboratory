@@ -244,3 +244,36 @@ Verified after deleting: `flowsheets` still returns `1,440,918,933` via the same
 
 **Left open, not decided:** how the pytorch/training container will actually reach the
 warehouse data. Genuinely unresolved (not just deprioritized) — no design started.
+
+## 2026-08-20 — VS Code remote-kernel setup; XSRF bug; default CMD
+
+**Connected a Windows-native notebook client (VS Code) to the container as a remote
+kernel** — "Existing Jupyter Server" pointed at `http://localhost:8888/`, rather than
+using the browser UI. First attempt looked connected but cells stayed queued forever.
+Diagnosed with a quick cell (`platform.system()`) that turned out to still say
+`Windows jamespc` — VS Code had silently fallen back to a local interpreter, not the
+remote one, because nothing was actually running on port 8888 at the time.
+
+**Second attempt, real bug:** with `jupyter.ps1` actually running and VS Code correctly
+pointed at it, cells *still* hung. Container logs showed the real cause: `403 POST
+/api/sessions ... '_xsrf' argument missing from POST`. Jupyter Server's CSRF protection
+expects a browser-style cookie handshake that VS Code's non-browser Jupyter client
+doesn't do, so every session-creation request was silently rejected and cells just queued
+forever with no visible error on the VS Code side. Fixed with
+`--ServerApp.disable_check_xsrf=True` in `scripts/start_lab.sh` (safe here — no auth on
+this server either way, loopback/LAN dev use only). Verified the fix directly by
+replaying the same POST curl would send and confirming `403` → `201`, before telling the
+user to reconnect.
+
+**Set a default `CMD`** (`sh /work/scripts/start_lab.sh`) and `EXPOSE 8888 9494` in the
+`Dockerfile`, so a bare `docker run` (mounts only, no explicit command) launches the full
+lab. Costs nothing for existing usage — `query.ps1` and ingestion already pass their own
+explicit commands, which override `CMD` regardless. Verified with a real bare `docker run`
+(no command argument) — Quack came up and answered a query correctly on first try.
+
+**Created `EDA/patient_age_los_distributions.ipynb`** — first real notebook against the
+warehouse: age and length-of-stay distributions from `bronze.patient_information`
+(65,728 surgeries; age mean 55.1/range 17–90; LOS mean 7.4 days, median 2, right-skewed
+per the log-scale plot). Whether this goes into git or stays local-only is still an open
+question — aggregate stats/histograms, not patient-level rows, but flagged rather than
+decided unilaterally given the data sensitivity throughout this project.

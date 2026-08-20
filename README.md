@@ -58,6 +58,10 @@ project's environment.
 
 ### Running things
 
+The image's default command launches the lab (JupyterLab + Quack) automatically, so a
+plain `docker run` with the right mounts (no command needed) already works — `jupyter.ps1`
+just adds the port publishing and env vars as a one-line wrapper.
+
 ```powershell
 # Interactive Python/DuckDB shell against all 10 bronze tables
 .\query.ps1
