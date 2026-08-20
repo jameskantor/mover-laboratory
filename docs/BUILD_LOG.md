@@ -216,3 +216,31 @@ driver problem, just two servers fighting over the same port.
 (native CLI, DBeaver) reach the data over the network; the data and the query engine both
 live in the container; nothing on the Windows side reads a warehouse file directly
 anymore.
+
+## 2026-08-20 — Folded Quack into jupyter.ps1; cleaned up the redundant warehouse copy
+
+Closed out the open items from the previous entry.
+
+**Folded the standalone Quack server into `jupyter.ps1`'s container**, rather than keeping
+it as a separate dedicated one. `scripts/start_lab.sh` starts `quack_server.py` in the
+background and `jupyter lab` in the foreground, both in the same container — one
+persistent container serving notebook + network-query roles together, both ports
+(`8888`, `9494`) published. Verified with a real test: brought up the merged container,
+confirmed a Quack query returns the correct `patient_information` count (65,728) and
+JupyterLab responds (HTTP 302 on `/`), before removing the old standalone `mover-quack`
+container and `quack.ps1`. `quack_server.py`'s docstring updated to point at
+`jupyter.ps1`/`start_lab.sh` instead.
+
+**Deleted the redundant pre-migration warehouse copy** at `D:\...\iceberg_warehouse\`
+(4.9GB — `bronze/`, `catalog.db`, `_ingestion_status.json`, plus the two stray
+`mover.duckdb`/`ui_session.duckdb` files from the earlier DBeaver-direct-file testing,
+also now obsolete since DBeaver connects via Quack). Confirmed safe first: `query.ps1` /
+`jupyter.ps1` mount `mover-warehouse` as a *nested volume* at `/work/iceberg_warehouse`,
+which shadows whatever's physically at that path on the host inside the container's mount
+namespace — so nothing running actually reads the D: copy anymore, regardless of the
+`WINDOWS_HOST_PATH`/`MOVER_WAREHOUSE_DIR` symlink chain still pointing through it.
+Verified after deleting: `flowsheets` still returns `1,440,918,933` via the same
+`iceberg_scan()` path used throughout this log.
+
+**Left open, not decided:** how the pytorch/training container will actually reach the
+warehouse data. Genuinely unresolved (not just deprioritized) — no design started.

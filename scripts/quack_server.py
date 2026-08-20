@@ -5,9 +5,8 @@ reading files directly -- the container is where the data and the query engine l
 Quack is beta (shipped 2026-05-12, stabilizes with DuckDB v2.0 in Sept 2026): expect
 breaking changes. See docs/BUILD_LOG.md for why this is a prototype, not yet "the" pattern.
 
-Run with: docker run --rm -p 9494:9494 -v "${PWD}:/work" -v mover-warehouse:/work/iceberg_warehouse
-    mover-laboratory:latest python /work/scripts/quack_server.py
-(or just use quack.ps1 from the project root)
+Started automatically by jupyter.ps1 (via scripts/start_lab.sh), alongside JupyterLab in
+the same container -- one persistent container serving both roles, not a separate one.
 
 Native DuckDB CLI test, once running:
     ATTACH 'quack:localhost:9494?token=mover-lab-dev-token' AS bronze (TYPE quack);
