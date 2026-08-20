@@ -118,7 +118,8 @@ volume inspect mover-warehouse` to find it, not the filesystem.
 - No experiment tracking (MLflow/W&B) set up yet — needed before the ML phase.
 - Single copy of the data outside G: — no offsite/cloud backup.
 - See `docs/DATA_DICTIONARY.md` → "Open items / TODO" for the data-pipeline-specific next
-  steps (silver layer design, complication-label validation, gold feature tables).
+  steps (silver layer design, gold feature tables). Postop-complication label validation
+  is done — the 11-class taxonomy is confirmed against the paper and ready to use.
 
 ## Development log
 

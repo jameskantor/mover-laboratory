@@ -157,13 +157,45 @@ per-row flags above are pieces of that larger question, not independent issues.
 
 ### patient_post_op_complications.csv — SmartData postop elements
 
-6 columns. Confirmed via official docs: `Element_Name` = type of complication,
-`Element_abbr` = abbreviation, `CONTEXT_NAME` = one of **encounter / order / note**
-(confirmed 3 values in sample), `SMRTDTA_ELEM_VALUE` = genuine free text (510 unique
-values in sample, 193,354 sample nulls — most complications have no extra free text).
-Paper documents 11 complication classes; this table's `Element_Name`/`Element_abbr`
-(12 unique in sample) is the closest mapping, not a guaranteed 1:1 — verify before
-using as a fixed label taxonomy.
+6 real columns (+ provenance), 203,945 rows. All 6 columns are actually documented by
+MOVER (unlike `patient_medications`) — reviewed column by column against docs + real
+data with the user, same process as before.
+
+**Label taxonomy — RESOLVED (previously an open item):** `Element_Name`/`Element_abbr`
+has 12 distinct values, not 11. One of them, `AN AQI POST-OP COMPLICATIONS` /
+`AN Post-op Complications` (200,139 rows — dwarfs everything else), is a generic
+"a postop complication was documented" flag, almost certainly tied to required AQI
+(Anesthesia Quality Institute / NACOR) reporting — not a specific complication type.
+**The remaining 11 values match the MOVER paper's own Table 4 (11 complication classes)
+almost exactly, same names, same order:**
+
+| Class | Paper count | Our count |
+|---|---|---|
+| Other | 1,093 | 1,094 |
+| Cardiovascular | 861 | 866 |
+| Respiratory | 735 | 748 |
+| Airway | 373 | 375 |
+| Metabolic | 154 | 154 |
+| Neurological | 147 | 147 |
+| Administrative | 118 | 118 |
+| Injury/infection | 117 | 117 |
+| Medication | 94 | 94 |
+| Regional | 60 | 61 |
+| Chronic pain | 32 | 32 |
+
+(Samad et al., JAMIA Open 2023 — small per-class discrepancies are consistent with a
+slightly different dataset snapshot, not a mapping error.) The paper's own complications
+table never mentions AQI or a generic flag — confirming it's excluded from their 11-class
+taxonomy, not an unlabeled 12th class. **Usable directly as ML labels once the AQI-flag
+row is filtered out.**
+
+| Column | Source | Meaning | Notes |
+|---|---|---|---|
+| `MRN` | docs | Patient ID | confirmed |
+| `LOG_ID` | docs | Encounter number; duplicate `MRN`s expected (multiple surgeries per patient) | confirmed |
+| `Element_Name` / `Element_abbr` | docs | Complication type / abbreviation | see label taxonomy above |
+| `CONTEXT_NAME` | docs, confirmed | `ENCOUNTER` (85.6%), `ORDER` (7.9%), `NOTE` (6.5%) | **97.8% of the specific-class labels (3,722/3,806) sit under `CONTEXT_NAME = 'ENCOUNTER'`** — `ORDER`/`NOTE` are almost entirely just the generic AQI flag (only 84 specific-class rows between them). Filtering to `ENCOUNTER` gets nearly all real labels with much less noise |
+| `SMRTDTA_ELEM_VALUE` | docs | Free text detail | genuine free text, mostly null (most complications have no extra note) |
 
 ### patient_procedure events.csv — note the literal space in the filename
 
@@ -315,8 +347,10 @@ numeric encoding, block compression), not from partitioning.
 - [x] Write chunked ingestion script (CSV → typed → bronze Iceberg tables)
 - [x] `git init` + `.gitignore`
 - [x] Ingest all 9 EMR tables + flowsheets to bronze, verified via DuckDB
-- [ ] Verify the postop-complications `Element_Name`/`Element_abbr` values actually map
-      to the paper's 11 complication classes before using them as ML labels
+- [x] Verify the postop-complications `Element_Name`/`Element_abbr` values actually map
+      to the paper's 11 complication classes — confirmed, see `patient_post_op_complications`
+      section above (11 of 12 values match the paper's Table 4 almost exactly; the 12th is
+      a generic AQI reporting flag, not a class)
 - [ ] Design silver layer: consistent `LOG_ID`/`MRN` casing across tables, `HEIGHT`
       parsed to numeric, `WEIGHT` unit conversion if needed, `BIRTH_DATE` renamed to
       `age_years`
