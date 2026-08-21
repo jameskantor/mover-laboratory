@@ -128,11 +128,46 @@ in mind for any join against `patient_information`.
 than flat aggregates. `Observation Value` is float64 (554 sample nulls). `Collection
 Datetime` is a plain string, needs parsing.
 
-### patient_lda.csv — lines, drains, airways
+### patient_lda.csv — lines, drains, airways — 465,801 rows
 
-9 columns. `site` has 77,577 sample nulls (many LDAs have no site recorded).
-`placement_instant`/`removal_instant` are plain strings, needs parsing.
-`flo_meas_name` — 83 unique values in sample, low cardinality, dictionary-encodes well.
+9 columns, all documented by MOVER (docs page is `patient-lda.html`, not `-table.html`).
+CSV header matches bronze schema exactly. Conceptual hierarchy (per user): `Line_Group_Name`
+= broadest category → `flo_meas_name` = generic device type → `description` = the specific
+device instance (size/location/etc., system-templated, not free text — see below) →
+`properties_display` = the insertion/placement record.
+
+⚠️ **Confirmed 22.9% duplicate rows (106,534 of 465,801)** — see "Duplicate-row audit"
+section below for the full investigation and per-pairing breakdown. Don't aggregate or
+count devices from this table without deduplicating first.
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `LOG_ID` / `MRN` | string (join keys) | 0 nulls on both. 61,798 / 36,979 distinct. |
+| `description` | string, **templated** (not free text) | 0 nulls, 87,791 distinct. Confirmed system-generated concatenation, consistent slot structure per device type: `[STATUS] {Device Name} - {date} [time] {placer role} {material/attributes} {size} {flag}` (e.g. `[REMOVED] Indwelling Urinary Catheter -  10/12/18 OR Standard (Latex) 14 fr 10 ml Yes`). **99.2% of rows (461,960) carry a `[REMOVED]` prefix** — but this does *not* map cleanly to `removal_instant` being populated (that's true for 99.996% of rows regardless of the tag), so `[REMOVED]` isn't simply "device has since been removed." Open item: real meaning of the tag not yet resolved — the 3,839 untagged rows turned out to be the duplicate-row group (see below), so the tag may relate to which of a duplicate pair got the display-status treatment, not device status itself. |
+| `properties_display` | string, free text | 34 nulls, 76,937 distinct. Per user: the insertion/placement record — real samples confirm this (`Inserted By: RN  Insertion attempts: 1  Size: 22 G  Orientation: Right  PIV Location: Forearm`), also sometimes carries removal reason/post-removal assessment. Contains a recurring `(c)` token prefix on some sub-fields (e.g. `Inserted By: (c) OR`) — meaning not yet investigated. |
+| `flo_meas_name` | categorical | 2 nulls, 97 distinct (docs' implied ~83 was a sample undercount). The clean, standardized device/event category name in ALL CAPS — the structured counterpart to `description`'s free-text instance. |
+| `site` | categorical | **178,572 nulls (38.3%)** — not random: null is concentrated where the concept doesn't apply (e.g. `Incision` rows have no `site`, since location is embedded in `description` instead). 451 distinct values. |
+| `placement_instant` | timestamp | **13,850 nulls** — open item: asymmetric with `removal_instant`'s near-zero null rate; working theory is the device was placed before this encounter's monitoring window started but removed within it, not yet confirmed. |
+| `removal_instant` | timestamp | Only 2 nulls. 0 rows where `removal_instant < placement_instant` — full temporal integrity confirmed. |
+| `Line_Group_Name` | categorical | 215 nulls. **15 distinct values including 14 real non-null categories** — docs claim "12 categories," undercounts by 2. Investigated `"Line Type"` (3,874 rows) specifically since it read like a generic fallback bucket (similar shape to the AQI generic-flag finding in `patient_post_op_complications`) — **turned out to be a real, specific category**, not a fallback: groups specialized vascular-access devices (Introducer, Large Bore Access-VAD/ECMO, Arterial/Venous Sheath, Distal Perfusion Cannula-ECMO, Hemostasis Pressure Device, Esophageal Temperature Probe) — just an ambiguous category name, not a data quality issue. |
+
+**Duplicate-row finding detail:** 53,174 groups (106,534 rows, 22.9% of table) share
+identical `LOG_ID` + `description` + `placement_instant` + `site` but differ in
+`Line_Group_Name` — the same physical device charted under two different navigator
+categories simultaneously. All 5 pairings and counts:
+
+| `flo_meas_name` | Duplicated across | Groups |
+|---|---|---|
+| Indwelling Urinary Catheter | `Drain` + `Urinary Drainage` | 37,698 |
+| Wound Vac | `Drain` + `Wound Therapy` | 7,135 |
+| Pressure Ulcer Injury | `Pressure Ulcer Injury` + `Wound` | 5,833 |
+| Hemodialysis/Pheresis Catheter Access | `CVC Line` + `Drain` | 2,413 |
+| NG/OG/NJ Feeding Tube (NICU) | `Drain` + `Nasogastric/Orogastric tube` | 95 |
+
+`Drain` is the generic partner in 4 of 5 pairings — reads like Epic's LDA navigator files
+certain device types under both a generic "Drain" tab and their specific clinical tab for
+visibility, and the export captures both navigator placements as separate rows rather than
+one row with two tags.
 
 ### patient_medications.csv — medication orders + MAR records
 
@@ -390,6 +425,28 @@ numeric encoding, block compression), not from partitioning.
   native Windows DuckDB, not just from inside the container). Total across all 10 bronze
   tables: 1,502,559,444 rows.**
 
+## Duplicate-row audit (tracking)
+
+Found during the `patient_lda` column audit: 22.9% of that table's rows (106,534 of
+465,801) are exact duplicates of another row differing only in `Line_Group_Name` — same
+physical device charted under two navigator categories at once (e.g. `Drain` +
+`Urinary Drainage` for the same catheter). That's a large enough fraction to warrant a
+systematic duplicate-row check across every bronze table before silver, not just the ones
+already flagged.
+
+| Table | Dedup status | Notes |
+|---|---|---|
+| `patient_information` | Not checked | Low suspected risk — `LOG_ID` already confirmed unique (64,354 of 65,728 rows), but not exhaustively checked for full-row dupes |
+| `patient_history` | Not checked | |
+| `patient_visit` | Not checked | |
+| `patient_coding` | Not checked | Found 1 corrupted row during column audit (see above) — different issue, not a duplicate |
+| `patient_medications` | Not checked | Column audit found an `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue — different issue, not confirmed as row duplication |
+| `patient_post_op_complications` | Not checked | |
+| `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
+| `patient_procedure_events` | Not audited yet (columns unreviewed) | |
+| `patient_labs` | Not audited yet (columns unreviewed) | |
+| `flowsheets` | Not audited yet (columns unreviewed) | ~1.44B rows — dedup check here needs to be efficient, not a naive full-table self-join |
+
 ## Open items / TODO
 
 - [x] Design + write bronze Iceberg schemas incorporating the type corrections above
@@ -404,6 +461,9 @@ numeric encoding, block compression), not from partitioning.
 - [ ] Design silver layer: consistent `LOG_ID`/`MRN` casing across tables, `HEIGHT`
       parsed to numeric, `WEIGHT` unit conversion if needed, `BIRTH_DATE` renamed to
       `age_years`
+- [ ] Run the duplicate-row audit across all remaining bronze tables — see "Duplicate-row
+      audit" section above. `patient_lda` already confirmed at 22.9% duplicated; every
+      other table still needs checking before silver dedup logic is designed
 - [ ] Design gold-layer feature tables once a specific ML question is chosen (see
       candidate directions in project memory / earlier conversation — real-time
       intraoperative deterioration prediction was the favored direction)
