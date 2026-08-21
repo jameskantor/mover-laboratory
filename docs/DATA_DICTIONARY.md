@@ -264,11 +264,32 @@ row is filtered out.**
 | `CONTEXT_NAME` | docs, confirmed | `ENCOUNTER` (85.6%), `ORDER` (7.9%), `NOTE` (6.5%) | **97.8% of the specific-class labels (3,722/3,806) sit under `CONTEXT_NAME = 'ENCOUNTER'`** — `ORDER`/`NOTE` are almost entirely just the generic AQI flag (only 84 specific-class rows between them). Filtering to `ENCOUNTER` gets nearly all real labels with much less noise |
 | `SMRTDTA_ELEM_VALUE` | docs | Free text detail | genuine free text, mostly null (most complications have no extra note) |
 
-### patient_procedure events.csv — note the literal space in the filename
+### patient_procedure events.csv — note the literal space in the filename — 640,223 rows
 
-5 columns. `EVENT_DISPLAY_NAME` — 76 unique values in sample (low cardinality).
-`NOTE_TEXT` — 199,940 sample nulls out of 200k rows (almost always empty; only 23 unique
-non-null values in sample — largely boilerplate, not rich free text).
+5 columns. Docs page (`patient-procedure-events.html`) documents `MRN`, `LOG_ID`,
+`EVENT_DISPLAY_NAME`, `EVENT_TIME` — `NOTE_TEXT` is **undocumented**, same pattern as
+`patient_medications`' gaps. CSV header matches bronze schema exactly.
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `LOG_ID` / `MRN` | string (join keys) | 0 nulls on both. 43,600 / 28,316 distinct. |
+| `EVENT_DISPLAY_NAME` | categorical | 0 nulls, 90 distinct (docs' implied ~76 was a sample undercount). Docs: "name of the anesthesia event." Real values are a mix of true timeline checkpoints (`Anesthesia Start`/`Stop`, `Sign In`, `Induction`, `Intubation`, `Extubation`, `Emergence`, `Start`/`Stop Data Collection`, `Transported to PACU/ICU...`, `Visit Signed`) and clinical-count/administrative events (`Two Anti-Emetics Administered`, `IV Antibiotics`, `Narcotic Balance`, `Quick Note`, `Mark Now`, `Case Delayed`, `Data Artifact`). **Planned use (per user): estimate procedure/phase timing and build OR-efficiency quality metrics from the checkpoint subset** — see [[mover_or_efficiency_metrics]] for the full direction (anesthesia wait time, non-operative time). |
+| `EVENT_TIME` | timestamp | 0 nulls, 406,848 distinct. For the checkpoint event types specifically: the large majority of `LOG_ID`s have exactly one timestamp per checkpoint (clean for interval math), but a real minority have genuinely multiple *distinct* times — `Start Data Collection` 2.5% (967/38,335), `Emergence` 1.2% (419/35,199), `Stop Data Collection` 1.1% (438/38,322), `Intubation` 0.9% (273/30,000) — plausibly real re-events (failed intubation attempt, case pause/restart) rather than errors. Any duration feature needs an explicit first/last-occurrence rule for these. ⚠️ **`Anesthesia Stop` can genuinely occur after `Transported to PACU/ICU`** — confirmed by user, not a data error: of 36,967 encounters with both events, 85.9% have them at the exact same timestamp, 12.6% have `Anesthesia Stop` *after* PACU transport (commonly by tens of minutes to a few hours — anesthesiologist still documenting/monitoring in PACU before formal sign-off), and only 1.6% have the "expected" strict before-order. Two extreme outliers (~7.00 days after PACU, almost exactly 10,080/10,074 minutes) are likely a **system auto-close on undocumented records** — confirmed by user as a known (and considered weak) EHR governance pattern: an anesthesia record left uncharted gets administratively closed after a fixed timeout (here, ~7 days) rather than reviewed and completed the next day, which is how another system the user worked with handled it. |
+| `NOTE_TEXT` | string, free text, **undocumented by MOVER** | **640,013 nulls (99.97%)** — confirmed this is a genuine source-data characteristic, not an ingestion failure: raw CSV has exactly 210 non-empty values, matching bronze's 210 non-null rows exactly. 79 distinct non-null values — largely boilerplate/checklist text (e.g. Aldrete-score-style scoring criteria: `"alert and oriented (or baseline) [2 points]  SpO2 > 92% on room air [2 points]"`), not rich narrative free text. |
+
+⚠️ **Data quality: exact-duplicate rows found, but with a nuance size-2 pairs might be
+legitimate.** 31,534 groups (67,393 of 640,223 rows, 10.5%) share identical `LOG_ID` +
+`MRN` + `EVENT_DISPLAY_NAME` + `EVENT_TIME` + `NOTE_TEXT`. Group-size distribution splits
+into two distinct phenomena:
+- **93.8% of duplicate groups (29,588) are exact size-2 pairs.** The top contributor,
+  `"Two Anti-Emetics Administered"` (18,730 of these pairs), might not be a bug at all —
+  the event name itself implies exactly 2 drugs given, so a 1-row-per-drug charting
+  convention is plausible. Not yet resolved whether all size-2 duplicates should be treated
+  as data quality issues or left alone — open item.
+- **A small number of extreme outliers, all `"Mark Now"`** (a generic anesthesia-record
+  timestamp-marker event): 8 groups with 10+ copies, up to **345 identical rows** for one
+  single `LOG_ID`/timestamp. This does look like a genuine charting glitch (repeated
+  clicks/stuck event) rather than a legitimate convention.
 
 ### patient_coding.csv — billing codes — 2,033,948 rows
 
@@ -348,6 +369,79 @@ parts 4-19 for the same reason (uneven upstream chunking, not a data problem).
 Given ~1.44 billion rows, this table is never loaded wholesale into pandas — all
 aggregation happens via DuckDB SQL directly against the Iceberg/Parquet files (see
 architecture notes below).
+
+## OR-efficiency timing / event sequencing (patient_procedure_events)
+
+Analysis run 2026-08-21 as groundwork for the planned OR-efficiency metrics direction (see
+`mover_or_efficiency_metrics` project memory) — working out the standard sequence of
+anesthesia/surgical timeline checkpoint events and which durations are computable from
+them, prompted by a user-recalled OR-efficiency model (anesthesia wait time = time from
+"room ready" to actual cutting, framed as unproductive/lost time).
+
+**Empirical sequence and gap durations**, from first-occurrence timestamps per `LOG_ID`
+(43,576 encounters have at least one of these checkpoints; the pairwise `n` below is
+lower per step since not every encounter has every checkpoint charted):
+
+| Step | n (both present) | Median gap | Mean gap |
+|---|---|---|---|
+| `Anesthesia Start` → `Start Data Collection` | 37,965 | 0 min | 0.8 min |
+| `Start Data Collection` → `Sign In` | 37,729 | 6 min | 6.4 min |
+| `Sign In` → `Induction` | 32,700 | 3 min | 4.9 min |
+| `Induction` → `Intubation` | 29,629 | 3 min | 3.6 min |
+| `Intubation` → `Anesthesia Ready` | 29,569 | 5 min | 9.4 min |
+| **`Anesthesia Ready` → `Emergence`** | 34,702 | **130 min** | **164 min** |
+| `Emergence` → `Extubation` | 29,299 | 5 min | 8.1 min |
+| `Extubation` → `Stop Data Collection` | 29,452 | 5 min | 8.3 min |
+| `Stop Data Collection` → `Anesthesia Stop` | 37,955 | 8 min | 10.1 min |
+
+Note on `Anesthesia Ready`: average rank-order places it *after* `Induction` and
+`Intubation` (not before, despite what the name might suggest in isolation) — confirmed
+this means "patient is intubated/monitored and genuinely ready for the surgeon to start,"
+not a pre-induction readiness check. That makes it the right conceptual anchor for an
+anesthesia-wait-style metric.
+
+**⚠️ Known gap: cannot split the `Anesthesia Ready → Emergence` window into "anesthesia
+wait" vs. "actual surgical time."** The literal cut-time marker, `Skin Incision`, is
+charted in only **51 of ~65,728 surgeries** — essentially unusable as a general-purpose
+signal. `patient_information.IN_OR_DTTM`/`OUT_OR_DTTM`/`AN_START_DATETIME`/
+`AN_STOP_DATETIME` are candidate proxies, not yet cross-validated against this table's
+events — open item.
+
+**Full-chain order validation** (all 10 checkpoints present, n=27,053 of 39,138
+encounters with ≥1 checkpoint — 31% missing at least one entirely):
+- Full sequence holds in **96.2%** of complete cases (26,014/27,053).
+- `Anesthesia Ready → Emergence` (the surgery-spanning gap) is essentially bulletproof:
+  only 4 violations.
+- Violations concentrate elsewhere: `Stop Data Collection → Anesthesia Stop` (336,
+  consistent with the `Anesthesia Stop`-lags-PACU pattern documented above),
+  `Intubation → Anesthesia Ready` (188), `Emergence → Extubation` (148),
+  **`Sign In → Induction` (134 in the complete-10 subset; 334 of 32,700 / 1.0% in the
+  broader sign-in-and-induction-present population)**.
+
+**`Sign In`/`Induction` order violation — investigated further per user request** (WHO
+Surgical Safety Checklist mandates Sign In before induction, so this deviation is real,
+not just an artifact of missing data):
+- Declining over time: **1.8% (2018) → 1.05% (2019) → 1.12% (2020) → 0.79% (2021) →
+  0.53% (2022)** — reads as genuine documentation-compliance improvement, not noise.
+- Inpatient encounters violate at **1.21%** (243/20,009) vs. Outpatient at **0.42%**
+  (43/10,275) — inpatients ~2.9x more likely. Plausible explanation: inpatient cases
+  (already admitted, potentially more urgent/complex, transported from floor/ICU) may
+  have a less standardized pre-op workflow than scheduled outpatient elective surgery.
+  Note: this correlation surfaced a previously-unflagged data quality issue — see
+  `patient_information` row-duplication note below.
+- 97.2% of violations (278/286) are `General` anesthesia, but General is also the
+  dominant type overall — flagged as directional only, not a confirmed differential
+  signal without a proper base-rate comparison.
+- Timestamps alone can't distinguish "Sign In physically happened first but was charted
+  late" from "the safety checklist step was actually skipped/delayed" — open
+  interpretation question, not resolvable from this data alone.
+
+**Side finding — added to "Duplicate-row audit" below**: while joining violation
+`LOG_ID`s back to `patient_information`, found that table has **65,728 total rows but
+only 64,354 distinct `LOG_ID`** (1,374 excess rows) — some `LOG_ID`s have more than one
+row. This wasn't flagged during `patient_information`'s own column audit (which noted the
+distinct count but didn't investigate the gap) — needs a proper look at whether these are
+exact duplicates or genuinely different rows sharing a `LOG_ID`.
 
 ## Architecture: bronze / silver / gold
 
@@ -436,14 +530,14 @@ already flagged.
 
 | Table | Dedup status | Notes |
 |---|---|---|
-| `patient_information` | Not checked | Low suspected risk — `LOG_ID` already confirmed unique (64,354 of 65,728 rows), but not exhaustively checked for full-row dupes |
+| `patient_information` | **Gap confirmed, not yet root-caused** | 65,728 total rows but only 64,354 distinct `LOG_ID` (1,374 excess rows) — some `LOG_ID`s have more than one row. Found incidentally during the `patient_procedure_events` sequencing analysis (2026-08-21), not during this table's own original column audit. Not yet checked whether these are exact duplicates or genuinely different rows sharing a `LOG_ID`. |
 | `patient_history` | Not checked | |
 | `patient_visit` | Not checked | |
 | `patient_coding` | Not checked | Found 1 corrupted row during column audit (see above) — different issue, not a duplicate |
 | `patient_medications` | Not checked | Column audit found an `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue — different issue, not confirmed as row duplication |
 | `patient_post_op_complications` | Not checked | |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
-| `patient_procedure_events` | Not audited yet (columns unreviewed) | |
+| `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
 | `patient_labs` | Not audited yet (columns unreviewed) | |
 | `flowsheets` | Not audited yet (columns unreviewed) | ~1.44B rows — dedup check here needs to be efficient, not a naive full-table self-join |
 
