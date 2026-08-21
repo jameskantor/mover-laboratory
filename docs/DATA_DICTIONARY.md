@@ -79,10 +79,18 @@ population counts, except where noted as "confirmed" from the official docs.
 | `PRIMARY_PROCEDURE_NM` | string/categorical | 6 nulls. **1,768 distinct values confirmed exact** (matches earlier sample-based estimate). Free-text procedure names; top values are a plausible clinical mix (cardiac catheterization, laparoscopic cholecystectomy, diagnostic laparoscopy, exploratory laparotomy, D&E uterus, etc.), no structural issues found. |
 | `IN_OR_DTTM`, `OUT_OR_DTTM`, `AN_START_DATETIME`, `AN_STOP_DATETIME` | timestamp | Nulls: 6,558 / 6,626 / 7,484 / 7,498 respectively — not one field gating the rest. Of the 6,558 `IN_OR_DTTM`-null rows, 5,285 (80.6%) have all four blank together; largely explained by **non-OR procedural locations** (top procedures: cardiac catheterization, apheresis/stem cell collection, right-heart-catheter insertion, lumbar puncture, AV fistulogram — cath lab/IR/bedside, not an OR), consistent with `PRIMARY_ANES_TYPE_NM` skewing to "Moderate Sedation - by non-anesthesia staff only" (37% vs. 13% baseline). A smaller true-OR subset (cholecystectomy, exploratory laparotomy, ORIF) is also blank — likely a genuine charting gap. ⚠️ Either way, surgery duration and anesthesia duration are unrecoverable for these rows — clinically and billing-relevant, since anesthesia time is billed by duration. |
 
-### patient_history.csv — patient diagnosis history
+### patient_history.csv — patient diagnosis history — 970,741 rows
 
-3 columns: `mrn` (lowercase!), `diagnosis_code`, `dx_name`. Sample: 15,623 unique `mrn`,
-4,070 unique `diagnosis_code` (47,359 sample nulls), 21,688 unique `dx_name`.
+3 columns: `mrn` (lowercase!), `diagnosis_code`, `dx_name`. 0 nulls on `mrn`/`dx_name`.
+43,547 distinct `mrn`, 6,050 distinct `diagnosis_code`, 59,056 distinct `dx_name` (full
+counts, not sample-based). CSV header matches bronze schema exactly, all 3 columns
+documented by MOVER — no gaps.
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `mrn` | string | lowercase column name (inconsistent with most other tables' `MRN`), 0 nulls |
+| `diagnosis_code` | string/categorical | Docs: ICD-9-CM. **Mostly confirmed** — real codes are genuinely ICD-9-CM shaped (numeric/decimal, plus 79,304 V-code and 2,844 E-code rows), despite the dataset spanning 2017–2023 (post ICD-10-CM mandate) — plausible since this is *history*, so entries can predate the ICD-10 cutover and never get recoded. **245,444 nulls (25.3%)** while `dx_name` is never null — per user, plausibly because diagnosis coding is a billing-system step that happens later/separately from the clinical record, so the name gets captured at time of care even when no code has been assigned yet. ⚠️ Found `IMO0001` (527 rows) is **not a real diagnosis code** — it's Epic's Intelligent Medical Objects "No-Map" placeholder, attached here to ~26 completely unrelated `dx_name` values (`No known problems`, `Opioid use agreement exists`, `Advanced age`, `Research study patient`, etc.). Don't treat `diagnosis_code` as 1:1 with `dx_name` for these rows. Also found 3 rows with a genuine ICD-10-CM-shaped code (`C44.91`) — a small leak past the stated ICD-9-CM standard. |
+| `dx_name` | string, free text | 0 nulls, always present even when `diagnosis_code` isn't (see above) |
 
 ### patient_visit.csv — visit-level diagnoses
 
