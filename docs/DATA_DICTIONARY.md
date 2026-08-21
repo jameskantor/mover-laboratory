@@ -121,12 +121,34 @@ encounter set, and largely disconnected from the rest of the warehouse (explaini
 near-total absence elsewhere). Not a data corruption issue — a real scope mismatch to keep
 in mind for any join against `patient_information`.
 
-### patient_labs.csv — lab results
+### patient_labs.csv — lab results — 29,079,344 rows
 
-10 columns. Sample of 200k rows collapses to just 982 unique `LOG_ID` / 829 unique `MRN`
-— **very dense per encounter**, good candidate for time-series/sequence features rather
-than flat aggregates. `Observation Value` is float64 (554 sample nulls). `Collection
-Datetime` is a plain string, needs parsing.
+10 columns. Docs page `patient-labs.html` documents `MRN`, `LOG_ID`, `Lab Code`,
+`Lab Name`, `Observation Value`, `Measurement Units`, `Reference Range`, `Abnormal Flag`,
+`Collection Datetime` — `ENC_TYPE_NM` is **undocumented**, same gap pattern as
+`patient_medications`/`patient_procedure_events`. CSV header matches bronze schema
+exactly (spaces → underscores). Very dense per encounter — good candidate for time-series/
+sequence features rather than flat aggregates. Docs confirm "possible for this table to
+have duplicate MRNs, indicating a single patient has come in for multiple surgeries" —
+verified, 10,653 `MRN`s span more than one `LOG_ID`.
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `LOG_ID` / `MRN` | string (join keys) | 0 nulls on both. 56,125 / 33,249 distinct. |
+| `ENC_TYPE_NM` | categorical, **undocumented** | 0 nulls, but only **1 distinct value** (`"Hospital Encounter"`) across all 29,079,344 rows — completely constant, zero information content. |
+| `Lab_Code` | string | 0 nulls, 1,533 distinct. Docs: LOINC code. **Fully confirmed** — 100% of rows (29,079,344/29,079,344) match the LOINC shape (`digits-checkdigit`), no exceptions found. |
+| `Lab_Name` | string/categorical | 0 nulls, 1,257 distinct. Paired with `Lab_Code`. |
+| `Observation_Value` | float | 89,716 nulls (0.3%). ⚠️ **`9999999.0` sentinel value in 13.7% of all rows (3,976,165)** — confirmed present in the raw CSV at the exact same count, not an ingestion artifact. Classified by cross-referencing `Lab_Name` against clinical/LOINC knowledge into 3 mechanisms: **(1)** purely qualitative tests forced into this numeric column, ~100% sentinel for that test (blood morphology flags, urine drug screen panels, serology, PCR detected/not-detected panels, blood typing, urinalysis dipstick items, method/panel-header rows that were never real results) — **(2)** normally-numeric tests with a small, consistent sentinel minority (<2% — `Potassium`, `Creatinine`, `Platelets`, `ALT`), plausibly lab-comment cases (hemolyzed specimen, instrument error, censored out-of-range value) — **(3)** tests genuinely split between qualitative-screen and quantitative-confirmatory reporting under one `Lab_Name`, 35–85% sentinel (`GFR` ~42–60%, consistent with the standard ">60" censored-reporting convention; `Urobilinogen`/`Ketones` ~83%; `Ethanol` ~78%; `hCG` ~70%; `Base excess` ~48%; `Fibrin D-dimer` ~35%). Confirmed with user. **Any numeric analysis on this column must filter the sentinel first.** |
+| `Measurement_Units` | categorical | 0 nulls, 151 distinct. `"Unknown"` in 4,819,392 rows (16.6%) — overlaps with but isn't identical to the `Observation_Value` sentinel set. |
+| `Reference_Range` | string | 0 nulls, 726 distinct. `"Unknown"` in 7,719,489 rows (26.6%). |
+| `Abnormal_Flag` | categorical | 201,610 nulls (0.7%). ⚠️ **5 distinct values, not the 3 docs describe** ("normal, low, or high") — real values are `N` (Normal, 18,578,102), `L` (Low, 5,320,856), `H` (High, 4,826,661), plus docs-omitted **`LL`** (Critical Low, 82,468) and **`HH`** (Critical High, 69,647) — a more clinically important distinction (critical values trigger different response protocols) that the docs simply don't mention. |
+| `Collection_Datetime` | timestamp | 0 nulls, 852,189 distinct. |
+
+⚠️ **Data quality: exact-duplicate rows confirmed at the source.** 54,979 groups
+(109,995 rows, 0.38% of table) share identical `LOG_ID` + `MRN` + `Lab_Code` +
+`Observation_Value` + `Collection_Datetime` (down to the minute) — verified a genuine
+example (a `287.0` Platelets result at the same encounter/timestamp) is present as two
+literal separate lines in the raw source CSV, not an ingestion bug.
 
 ### patient_lda.csv — lines, drains, airways — 465,801 rows
 
@@ -538,7 +560,7 @@ already flagged.
 | `patient_post_op_complications` | Not checked | |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
-| `patient_labs` | Not audited yet (columns unreviewed) | |
+| `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
 | `flowsheets` | Not audited yet (columns unreviewed) | ~1.44B rows — dedup check here needs to be efficient, not a naive full-table self-join |
 
 ## Open items / TODO
