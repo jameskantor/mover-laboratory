@@ -92,10 +92,34 @@ documented by MOVER — no gaps.
 | `diagnosis_code` | string/categorical | Docs: ICD-9-CM. **Mostly confirmed** — real codes are genuinely ICD-9-CM shaped (numeric/decimal, plus 79,304 V-code and 2,844 E-code rows), despite the dataset spanning 2017–2023 (post ICD-10-CM mandate) — plausible since this is *history*, so entries can predate the ICD-10 cutover and never get recoded. **245,444 nulls (25.3%)** while `dx_name` is never null — per user, plausibly because diagnosis coding is a billing-system step that happens later/separately from the clinical record, so the name gets captured at time of care even when no code has been assigned yet. ⚠️ Found `IMO0001` (527 rows) is **not a real diagnosis code** — it's Epic's Intelligent Medical Objects "No-Map" placeholder, attached here to ~26 completely unrelated `dx_name` values (`No known problems`, `Opioid use agreement exists`, `Advanced age`, `Research study patient`, etc.). Don't treat `diagnosis_code` as 1:1 with `dx_name` for these rows. Also found 3 rows with a genuine ICD-10-CM-shaped code (`C44.91`) — a small leak past the stated ICD-9-CM standard. |
 | `dx_name` | string, free text | 0 nulls, always present even when `diagnosis_code` isn't (see above) |
 
-### patient_visit.csv — visit-level diagnoses
+### patient_visit.csv — visit-level diagnoses — 219,257 rows
 
-4 columns: `LOG_ID`, `mrn` (lowercase!), `diagnosis_code`, `dx_name`. Sample: 52,923
-unique `LOG_ID`, 40,296 unique `mrn`, 3,525 unique `diagnosis_code` (58,188 sample nulls).
+4 columns: `LOG_ID`, `mrn` (lowercase!), `diagnosis_code`, `dx_name`. 0 nulls on
+`LOG_ID`/`mrn`/`dx_name`. 55,912 distinct `LOG_ID`, 42,116 distinct `mrn`, 3,604 distinct
+`diagnosis_code`, 25,331 distinct `dx_name` (full counts). CSV header matches bronze schema
+exactly, all 4 columns documented by MOVER. Same `diagnosis_code`/`dx_name` semantics as
+`patient_history` — ICD-9-CM claim holds (V/E-code and numeric shapes dominate), `IMO0001`
+Epic "No-Map" placeholder reappears (53 rows), `diagnosis_code` has 65,364 nulls (29.8%)
+against `dx_name`'s 0% — same plausible billing-coding-lag explanation.
+
+**Investigated finding — `patient_visit` is not scoped 1:1 to `patient_information`'s
+surgical cohort.** 6,761 of the 55,912 distinct `LOG_ID`s (12.1%, 21,856 rows / 10.0% of
+all rows) don't join back to `patient_information` at all. Investigation trail:
+- Diagnosis profile of the orphan `LOG_ID`s (Hypertension, ESRD, Sepsis, CAD, AKI, Trauma,
+  Prostate cancer — high-acuity, CMS-HCC-flagged conditions) closely resembles the matched
+  `LOG_ID`s' profile — ruled out "these are just routine/wellness visits."
+- But only **1,708 of 6,147 (27.8%)** orphan-`LOG_ID` `mrn`s ever appear as a surgical
+  patient in `patient_information` — most of these patients never had a surgery in this
+  dataset at all.
+- And the orphan `LOG_ID`s barely appear anywhere else in the warehouse: only 12 of 6,761
+  show up in `patient_labs`, only 16 in `patient_medications`.
+
+**Conclusion:** `patient_visit` appears to be pulled from a broader source population than
+the surgical cohort the rest of the bronze tables are built around — same health system,
+similar case mix (explaining the diagnosis-profile similarity), but not the same patient/
+encounter set, and largely disconnected from the rest of the warehouse (explaining the
+near-total absence elsewhere). Not a data corruption issue — a real scope mismatch to keep
+in mind for any join against `patient_information`.
 
 ### patient_labs.csv — lab results
 
