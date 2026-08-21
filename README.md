@@ -76,6 +76,15 @@ just adds the port publishing and env vars as a one-line wrapper.
 docker run --rm -v "/d/Data_Science_Projects/Mover:/work" -v mover-warehouse:/work/iceberg_warehouse mover-laboratory:latest python /work/scripts/ingest.py
 ```
 
+**Always-on instead of manual launch:** `jupyter.ps1` is `--rm -it` — disposable, and tied
+to whatever terminal started it. Run `.\autostart.ps1` once instead to create a detached,
+named (`mover-lab`) container with `--restart unless-stopped`, so Docker brings it back up
+on its own after any Docker restart. For that to also cover a full Windows restart, turn on
+Docker Desktop's own **Settings → General → "Start Docker Desktop when you sign in"** —
+without that, Docker Desktop (and everything in it) stays off until you launch it yourself,
+restart policy or not. `docker logs -f mover-lab` / `docker stop mover-lab` manage it from
+there; re-run `autostart.ps1` any time to recreate it (e.g. after rebuilding the image).
+
 By default `scripts/catalog.py` targets a portable `/work/iceberg_warehouse` — nothing in
 the code assumes Windows or a specific folder layout, so a fresh clone against your own
 data needs none of the env vars below. On *this* warehouse specifically, `query.ps1` /
