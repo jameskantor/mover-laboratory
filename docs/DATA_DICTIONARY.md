@@ -235,9 +235,27 @@ row is filtered out.**
 `NOTE_TEXT` — 199,940 sample nulls out of 200k rows (almost always empty; only 23 unique
 non-null values in sample — largely boilerplate, not rich free text).
 
-### patient_coding.csv — billing codes
+### patient_coding.csv — billing codes — 2,033,948 rows
 
-6 columns. `REF_BILL_CODE_SET_NAME` — only 2 unique values, 68,616 sample nulls.
+6 columns, all documented by MOVER (docs page is at `patient-coding.html`, not the
+`patient-coding-table.html` pattern most other tables use). CSV header matches bronze
+schema exactly.
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `MRN` | string | 0 nulls, 42,526 distinct |
+| `SOURCE_KEY` | int/categorical | 0 nulls, 7 distinct values. Docs: "represents the reference billing code set being used." |
+| `SOURCE_NAME` | categorical | 0 nulls, 8 distinct values (see truncation note below — 8 not 7 because of a corrupted row). Real code sets found: `Final Diagnosis Primary Code Set`, `External Cause of Injury Primary Code Set` (both ICD-10-CM), `ICD Procedure Primary Code Set` (ICD-10-PCS), and 4 CPT variants — `Charge CPT Code`, `Inpatient CPT Code`, `Combined CPT Code`, `Coding CPT Code`. Notably **no ICD-9** here (unlike `patient_history`/`patient_visit`) — consistent with this being later-stage billing coding, done post-2015-cutover, vs. `patient_history`'s legacy problem-list entries. |
+| `REF_BILL_CODE_SET_NAME` | categorical | **622,985 nulls (30.6%)** — but not random: populated only for the two ICD code sets (`ICD-10-CM`, `ICD-10-PCS`); null for every CPT-flavored `SOURCE_NAME` row. Docs describe it as the set's "abbreviation," but that abbreviation is only actually captured for ICD rows — CPT rows rely on `SOURCE_NAME` text alone to identify the code system. |
+| `NAME` | string, free text | 179 nulls, 34,350 distinct. "Name of what the patient is being billed for" (procedure/diagnosis description). |
+| `REF_BILL_CODE` | string | 1 null, 29,325 distinct. Format checked against `SOURCE_NAME`: ICD-10-CM and ICD-10-PCS rows are correctly shaped (e.g. `D75.839`, `02HV33Z`). ⚠️ The 4 "CPT" `SOURCE_NAME`s are actually a **mixed bag**, not pure CPT — true 5-digit-numeric CPT (`27130`), Category III CPT (`0184T`), and HCPCS Level II codes (`J0171`, `C1887`, `A6254`) all share the same "CPT Code" buckets; only 31.4% of `Charge CPT Code` rows (169,765/540,336) are actually 5-digit numeric. Don't assume `SOURCE_NAME` containing "CPT" means the code itself is CPT. Also found 2 rows with a lowercase code (`g0480`, should be `G0480`) — negligible, noted for completeness. |
+
+⚠️ **Data quality: 1 fully-corrupted row** (`MRN 7ace7e3e41b4f9c0`, `SOURCE_KEY=3`,
+`SOURCE_NAME='Final Di'`, with `NAME`/`REF_BILL_CODE_SET_NAME`/`REF_BILL_CODE` all null) —
+`SOURCE_NAME` is truncated mid-word (should be `"Final Diagnosis Primary Code Set"`, the
+other 989,632 `SOURCE_KEY=3` rows). Shape suggests a CSV parsing artifact (a record split
+mid-row upstream), not a wording/dictionary variant like earlier findings. Accounts for 1
+of `NAME`'s 179 nulls and the sole `REF_BILL_CODE` null. Negligible at 1-in-2M rows.
 
 ### flowsheets_cleaned/ — patient measurements (vitals), the 10th EPIC table
 
