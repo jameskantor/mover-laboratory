@@ -345,9 +345,43 @@ a raw Python `csv` module count, and a post-ingestion DuckDB query. No data was 
 this was a documentation bug in the original audit script, not an ingestion defect.)
 Confirmed via official docs:
 `FLO_NAME` = category of measurement, `FLO_DISPLAY_NAME` = measurement name, `UNITS` =
-unit for the value, `RECORD_TYPE` = **pre-op / peri-op / post-op** (confirmed 3 values),
-`RECORDED_TIME` = exact timestamp (docs call this column `RECORD_TIME`, CSV header says
-`RECORDED_TIME` — same field). `MRN`/`LOG_ID` defined same as elsewhere.
+unit for the value, `RECORD_TYPE` = **PRE-OP / INTRA-OP / POST-OP** (corrected from an
+earlier "peri-op" — the real value is literally `INTRA-OP`; per user, on a clinical
+flowsheet, perioperative staff document body systems across these three windows — pre,
+intra, post op), `RECORDED_TIME` = exact timestamp (docs call this column `RECORD_TIME`,
+CSV header says `RECORDED_TIME` — same field). `MRN`/`LOG_ID` defined same as elsewhere.
+
+**Full column audit completed 2026-08-21** (all 9 real columns, ~1.44B rows — every
+aggregation below ran directly against Iceberg/Parquet via DuckDB, no pandas load,
+typically sub-3-second even at this scale thanks to column pruning):
+
+| Column | Type decision | Notes |
+|---|---|---|
+| `LOG_ID` / `MRN` | string (join keys) | 0 nulls on both. |
+| `FLO_NAME` | categorical | 148 distinct. ⚠️ **Same trailing-whitespace duplicate pattern found elsewhere in this dataset, but at by far the largest scale**: `"Vital Signs "` (trailing space, 399,407,875 rows — **27.7% of the entire table**) vs. `"Vital Signs"` (15,662,822 rows); same for `"CCP Vital Signs "` vs `"CCP Vital Signs"`. Added to the silver-layer TODO as a standard trim-all-categoricals step, not a one-off fix. |
+| `FLO_DISPLAY_NAME` | categorical | 121 distinct. Many-to-many with `FLO_NAME` **by design, not a data quality issue** — e.g. `Resp`/`Pulse`/`SpO2`/`Temp` each appear under 40–63 different `FLO_NAME` categories, because different care-unit flowsheet templates (Vital Signs, CCP Vital Signs, ED Vitals, Dialysis Vitals, General Respiratory, etc.) reuse the same underlying measurement names. `FLO_NAME` = which template, `FLO_DISPLAY_NAME` = which measurement. |
+| `RECORD_TYPE` | categorical | **177,471,630 nulls (12.3%)** — not previously documented (earlier notes only covered the 3 real values). Null rate is fairly even across the top flowsheet categories (8.4%–16.3%, no single type dominating) and spans the same full 2017–2023 date range as non-null rows — reads as scattered/normal missingness (charting outside the strict pre/intra/post-op window boundary), not a systematic gap. |
+| `RECORDED_TIME` | timestamp | **1 null out of 1,440,918,933 rows** — essentially fully populated. |
+| `MEAS_VALUE_NUM` / `MEAS_VALUE_TXT` | float / string | Confirmed cleanly mutually exclusive — **0 rows have both populated**. 278,722,196 rows (19.3%) have `MEAS_VALUE_NUM` null (i.e. text-only), 1,165,971,902 (80.9%) have `MEAS_VALUE_TXT` null (numeric-only), and **3,775,165 rows (0.26%) have neither** — investigated and this isn't a bug: the "no value" rows are concentrated in checkbox-style (`OR COMPLICATIONS` — blank plausibly means "nothing checked"), conditionally-populated (`Arterial Line BP/MAP`, only present when that line exists), and computed (`Custom Formula Data` min/max fields, blank when insufficient underlying readings exist) flowsheet rows — normal sparse EHR flowsheet-grid behavior, not missing data. `MEAS_VALUE_TXT` content confirmed rich and clinically real: cardiac rhythm (`NSR`, `ST`), probe/measurement site (`Left arm`, `Axillary`, `Bladder`), O2 device (`None (Room air)`, `ETT`, `NC`, `Trach mask`), pain scale (`CPOT`). |
+| `UNITS` | categorical | 946,121,623 nulls (65.7% — expected, most qualitative flowsheet items have no unit). ⚠️ **Same casing/typo duplicate pattern as `FLO_NAME`, but for units**: `cmH20` (digit zero, 23,612,311 rows) vs. `cmH2O` (letter O, 23,580,046 rows) — a typo, not a different unit; `l/min` (45,585,284) vs. `L/min` (17,904,997) — case variant of the same unit; `ml` (20,113,755) vs. `mL` (28,146,660) — same. Also added to the silver trim/normalize TODO. Found one tiny (6-row) genuine **CSV-escaping bug**: an unescaped double-quote inside a free-text `MEAS_VALUE_TXT` note (`"...verbalized im okay" when asked..."`) broke CSV field parsing, spilling garbage (`,",",488"`) into `UNITS` for that record — a different corruption class than the whitespace/casing issues, negligible in volume. |
+
+Dropped `Unnamed: 0` pandas index column confirmed harmless — verified directly against the
+raw CSV, it's just a monotonic `0,1,2,...` row counter, no real data.
+
+🚨 **Duplicate-row check completed (took ~267s, much heavier than every other query on
+this table) with an extreme, unresolved result: 916,048,965 of 1,440,918,933 rows —
+63.6% of the entire table — are involved in exact-duplicate groups (133,971,114 groups,
+full 9-column match).** This is far higher than any other table checked this session
+(`patient_lda` was the next-highest at 22.9%). **Not yet investigated at all** — this
+number alone doesn't distinguish between two very different explanations: (a) a genuine
+massive data/ingestion quality issue, or (b) a legitimate EHR "carry-forward" charting
+behavior (the same value re-charted into interval placeholder cells so a flowsheet cell
+never appears blank) that would look identical to duplication in a raw row count but
+isn't actually redundant data. **Top priority item for next session** — needs the same
+treatment `patient_lda`'s duplicates got (find what's actually shared across the
+"duplicate" rows, check a few real examples, bring in the user's clinical read on
+whether repeat-charting is a real workflow) before concluding anything about severity or
+how to handle it in silver.
 
 `MEAS_VALUE` is genuinely mixed-type (confirmed via sampling 500k rows each of parts
 1 and 2): **~75–80% numeric, ~20–23% text, <0.4% null**. Must be split into
@@ -561,7 +595,7 @@ already flagged.
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
 | `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
-| `flowsheets` | Not audited yet (columns unreviewed) | ~1.44B rows — dedup check here needs to be efficient, not a naive full-table self-join |
+| `flowsheets` | 🚨 **Confirmed — 63.6% of rows duplicated (916,048,965/1,440,918,933), NOT YET INVESTIGATED** | By far the highest rate found across the whole warehouse. Unresolved whether this is a real data quality issue or legitimate carry-forward charting behavior — top priority for next session, see full write-up above |
 
 ## Open items / TODO
 
@@ -576,7 +610,12 @@ already flagged.
       a generic AQI reporting flag, not a class)
 - [ ] Design silver layer: consistent `LOG_ID`/`MRN` casing across tables, `HEIGHT`
       parsed to numeric, `WEIGHT` unit conversion if needed, `BIRTH_DATE` renamed to
-      `age_years`
+      `age_years`, **trim all categorical string columns as a standard step** — a
+      trailing-whitespace duplicate (same label, one with a trailing space) has now
+      shown up repeatedly across independent tables (`patient_medications`'
+      `PRIMARY_ANES_TYPE_NM` "MAC", `flowsheets`' `FLO_NAME` "Vital Signs" — the latter
+      affecting 27.7% of that table's 1.44B rows) — handle it once in silver, not
+      per-query
 - [ ] Run the duplicate-row audit across all remaining bronze tables — see "Duplicate-row
       audit" section above. `patient_lda` already confirmed at 22.9% duplicated; every
       other table still needs checking before silver dedup logic is designed
