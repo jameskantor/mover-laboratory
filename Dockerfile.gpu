@@ -1,0 +1,15 @@
+# GPU data-prep benchmark image for the RAPIDS cuDF evaluation (docs/TECH_EVALUATIONS.md).
+# Extends the already-GPU-proven pytorch base rather than a separate RAPIDS base image,
+# per that evaluation's "one combined image" finding.
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+
+RUN pip install --no-cache-dir \
+    "pyiceberg[sql-sqlite,pyarrow]" \
+    duckdb \
+    pandas \
+    pyarrow \
+    psutil
+
+RUN pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com cudf-cu12
+
+WORKDIR /work

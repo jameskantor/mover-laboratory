@@ -1,4 +1,4 @@
-# Clinical data - never commit, HIPAA-governed even when de-identified
+# Clinical data - never commit, MOVER's DUA doesn't allow redistribution
 EMR/
 *.csv
 *.parquet

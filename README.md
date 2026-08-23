@@ -8,9 +8,9 @@ Source paper: Samad et al., *"Medical Informatics Operating Room Vitals and Even
 Repository (MOVER): a public-access operating room database"*, JAMIA Open 2023,
 https://doi.org/10.1093/jamiaopen/ooad084
 
-**This data is HIPAA-governed (de-identified, credentialed-access).** Never commit raw
-data, samples, or query output containing patient-level rows to git or any third-party
-service. `.gitignore` already excludes CSVs, the Iceberg warehouse, and logs.
+**This data is de-identified and credentialed-access (not HIPAA-regulated); this repo is
+private.** Raw source data (CSVs, the Iceberg warehouse) still isn't committed, since the
+MOVER agreement doesn't allow redistributing it — `.gitignore` excludes those and logs.
 
 **This README's job is to let someone else stand up their own copy of this lab** — their
 own machine, their own credentialed MOVER download, the same containers and scripts. It
@@ -97,7 +97,8 @@ to the current Docker volume. Cosmetic, not required for a new setup.
 
 ```
 Dockerfile, entrypoint.sh      → mover-laboratory image build
-jupyter.ps1, query.ps1         → entry points into that image
+jupyter.ps1, query.ps1         → entry points into that image (disposable/foreground)
+autostart.ps1                  → persistent, restart-policy entry point (prefer this)
 scripts/
   catalog.py                   → PyIceberg SqlCatalog config (warehouse location)
   schemas.py                   → per-table Iceberg schemas + partition specs
@@ -111,6 +112,7 @@ scripts/
 docs/
   DATA_DICTIONARY.md           → canonical column definitions + ingestion log
   BUILD_LOG.md                 → our own build/experiment history (not the repro guide)
+  TECH_EVALUATIONS.md          → candidate tools/tech under consideration, pre-decision
 EMR/                           → working CSV copy (gitignored)
 ```
 

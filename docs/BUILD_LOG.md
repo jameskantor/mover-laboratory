@@ -12,7 +12,9 @@ Skip it entirely if you just want to run the pipeline.
 
 For the data-ingestion-specific log (row counts, schema decisions, type fixes per table),
 see `DATA_DICTIONARY.md` → "Ingestion log" — entries below reference it rather than
-duplicating it.
+duplicating it. For a candidate technology's comparison/evaluation *before* a decision
+gets made (vs. the integration work once it's adopted, which belongs here), see
+`TECH_EVALUATIONS.md`.
 
 ---
 
@@ -287,3 +289,76 @@ warehouse: age and length-of-stay distributions from `bronze.patient_information
 per the log-scale plot). Whether this goes into git or stays local-only is still an open
 question — aggregate stats/histograms, not patient-level rows, but flagged rather than
 decided unilaterally given the data sensitivity throughout this project.
+
+## 2026-08-23 — Stray `D:/` directory from GPU container testing
+
+Found a literal `D:\Data_Science_Projects\Mover\D:\Data_Science_Projects\Mover\
+iceberg_warehouse\` directory tree sitting on disk — empty, harmless, already covered by
+`.gitignore`'s `iceberg_warehouse/` pattern, but confusing to see in an editor's file
+tree. Root cause: `entrypoint.sh`'s `WINDOWS_HOST_PATH` symlink logic (`mkdir -p
+$(dirname /$WINDOWS_HOST_PATH) && ln -s /work "/$WINDOWS_HOST_PATH"`) is meant to create
+that symlink inside the container's own filesystem only. Running the `Dockerfile.gpu`
+container with the whole project root bind-mounted at `/work` plus that same env var
+caused it to materialize as real nested directories on the Windows host instead — not
+reproduced by the normal `mover-laboratory` container path (bronze's warehouse lives in
+the `mover-warehouse` Docker volume, not through this mechanism at all). Deleted; if it
+recurs, avoid bind-mounting the full project root together with `WINDOWS_HOST_PATH` set.
+
+## 2026-08-22/23 — GPU BSOD investigation: RAPIDS cuDF evaluation dropped, GPU training parked
+
+**What happened:** starting the "GPU-accelerated dataframe prep" evaluation (RAPIDS
+`cuDF` via `scripts/bench_gpu_dataprep.py` / `Dockerfile.gpu`, see
+`docs/TECH_EVALUATIONS.md`) reliably triggered full-system Windows BSODs — bugcheck
+`0x133 DPC_WATCHDOG_VIOLATION` — on this laptop (Lenovo Legion Pro 7 16IAX10H, RTX 5090
+Laptop GPU). Four crashes across two days, all under real GPU load from the same
+benchmark. Root-caused via `cdb.exe -z <dump> -c "!analyze -v"` to a stuck DPC, first
+twice directly in `nvlddmkm.sys` (the NVIDIA driver), later once in `dxgmms2.sys`
+(Windows' own GPU scheduler, one layer up the same call chain). Confirmed via web
+research this is a widely-reported issue on RTX 5090 laptops (NVIDIA forum thread with
+215 dumps, 100% consistent signature, since Aug 2025) with a documented root cause: the
+BIOS/EC fails to respond to a GPU power-state transition request in time
+(`ACPI.sys` DPC latency ~34,000µs), leaving the GPU firmware and the OS driver
+disagreeing about its power state, and the driver thread blocks forever waiting for a
+state change that never comes.
+
+**Mitigations tried, in order, none of which eliminated the issue:**
+1. BIOS update (was already current — `Q7CN78WW`, confirmed via Lenovo Vantage).
+2. Driver downgrade from generic NVIDIA Studio `610.88` to the Lenovo-qualified `592.01`
+   — nontrivial on its own: NVIDIA App's driver auto-update silently reinstalled
+   `610.88` minutes after the first downgrade attempt (traced via its own logs), and
+   separately Windows' driver-ranking silently no-op'd a same-rank reinstall attempt
+   (had to force it via Device Manager → "let me pick from a list"). Disabled NVIDIA
+   App's auto-update (`NvBackend/config.xml`) so the downgrade would actually stick.
+3. PCIe ASPM (Link State Power Management): Maximum power savings → Off.
+4. Intel(R) Graphics power plan (relevant to Optimus/hybrid-graphics dGPU switching):
+   Balanced → Maximum Performance.
+5. Display sleep timeout: 10min/3min → Never (display-off is itself a GPU power-state
+   transition, matching the root-cause mechanism directly).
+6. GPU Working Mode (BIOS-level MUX switch): Hybrid → dGPU-only, i.e. removed
+   Optimus-style dGPU power-gating entirely, the most directly-targeted fix attempted.
+
+**Result: the dGPU-only-mode retest produced a worse failure than any prior crash** — a
+full unresponsive system freeze with no BSOD, no crash dump, and no auto-recovery,
+requiring a hard power-off. Confirmed via Windows Event Log (Event 41/6008, "system
+stopped responding... unexpected shutdown") that no new bugcheck occurred — the DPC
+watchdog that had reliably caught (and recovered from) every prior incident didn't fire
+this time, consistent with an even lower-level freeze (possibly SMI/firmware-level,
+halting interrupt/timer delivery entirely) than what the watchdog can detect.
+
+**Decision: stopped here rather than continuing to escalate mitigations on a laptop that
+now has one crash mode with no safety net.** Reframed the actual need instead of
+continuing to chase the bug:
+- **RAPIDS/cuDF is not needed** — DuckDB already handles the target workload (aggregations
+  over the 1.44B-row `flowsheets` table) in under 3 seconds with no GPU. Every crash this
+  week came from validating a tool that wasn't blocking anything. Verdict: **rejected**,
+  see `docs/TECH_EVALUATIONS.md`.
+- **GPU model training (PyTorch) is a separate, real dependency** — and notably, this
+  same GPU trained a CNN successfully as recently as 2026-01-25 (a `pytorch/pytorch`
+  Docker container, clean exit), 7 months before any of this week's crashes. That's
+  evidence this is a recent regression (plausibly the NVIDIA-App auto-driver-update
+  behavior found and disabled during this investigation moving the machine onto a bad
+  driver branch), not an inherent hardware limitation. Whether sustained real PyTorch
+  training hits the same bug was never tested — only `cuDF` was. **Parked** as an open
+  question for a dedicated future session, gated on the still-undecided tabular-vs-
+  sequence model architecture choice that determines whether GPU training is even
+  needed yet.

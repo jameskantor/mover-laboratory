@@ -61,7 +61,7 @@ population counts, except where noted as "confirmed" from the official docs.
 | Column | Type decision | Notes |
 |---|---|---|
 | `LOG_ID` | string (surrogate key) | non-null, 64,354 unique in sample of 65,728 rows |
-| `MRN` | string | non-null |
+| `MRN` | string | Patient-level key (`LOG_ID` is encounter-level). Non-null. 39,685 distinct values — matches the paper's reported patient count exactly. ⚠️ **26 of those are corrupted into scientific notation** (`2.75E+15`, `9.04E+18`, …), affecting 38 rows / 37 encounters. Present in the source, not introduced here. See "MRN corruption and patient-level linkage" below before using `MRN` as a join or grouping key. |
 | `DISCH_DISP_C` | **int/categorical**, not float | Standard Epic hospital discharge-disposition code set (Expired, Home Routine, SNF, Hospice, AMA, Rehab, etc.), not MOVER-specific. ⚠️ Docs claim "class 1–100" — **wrong**, real range goes up to **109** (`Home Healthcare Outpatient Related`), confirmed against full distinct-value dump. **7 nulls** (of 65,728 rows) — not fully non-null as the automated pass assumed. Pandas infers float64 due to source formatting — cast explicitly. |
 | `DISCH_DISP` | string/categorical | Name paired with `DISCH_DISP_C`. Code `69` has two name variants in the data — `"Designated Disaster Alternative Care Site"` vs `"Designated Disaster Alternate Care Site"` (3 rows each) — confirmed by the user to be a mid-dataset Epic dictionary wording update, not a data quality bug. Leave both mapped to the same code in silver. |
 | `HOSP_ADMSN_TIME`, `HOSP_DISCH_TIME` | timestamp | Currently plain strings in CSV — parse at bronze time. `HOSP_ADMSN_TIME`: 0 nulls. `HOSP_DISCH_TIME`: **14 nulls**, confirmed as genuinely still-open admissions at extraction time, not a data gap — all 14 trace back to just 2 distinct `HOSP_ADMSN_TIME` values, each shared across multiple `LOG_ID`s (i.e. one long admission containing several separate surgical encounters), and their linked `patient_medications.ORDER_STATUS_NM` skews less-terminal than baseline (78.6% `Discontinued` vs. 91.1% dataset-wide). `LOS` matches `date_diff('day', HOSP_ADMSN_TIME, HOSP_DISCH_TIME)` exactly for every non-null row — confirms `LOS` is directly derived from these two columns. No rows where discharge precedes admission. Range 2017-11-09 to 2023-08-10. |
@@ -586,7 +586,7 @@ already flagged.
 
 | Table | Dedup status | Notes |
 |---|---|---|
-| `patient_information` | **Gap confirmed, not yet root-caused** | 65,728 total rows but only 64,354 distinct `LOG_ID` (1,374 excess rows) — some `LOG_ID`s have more than one row. Found incidentally during the `patient_procedure_events` sequencing analysis (2026-08-21), not during this table's own original column audit. Not yet checked whether these are exact duplicates or genuinely different rows sharing a `LOG_ID`. |
+| `patient_information` | **Gap confirmed, externally corroborated, row content not yet inspected** | 65,728 total rows but only 64,354 distinct `LOG_ID` (1,374 excess rows). Found incidentally during the `patient_procedure_events` sequencing analysis (2026-08-21). **2026-08-23: externally confirmed 64,354 is the correct count** — the official MOVER paper's own stated surgery count for the EPIC dataset is 64,354, matching the distinct-`LOG_ID` count exactly, not the raw row count. Still not checked whether the 1,374 excess rows are exact duplicates or genuinely divergent content sharing a `LOG_ID` — see "Silver-layer design checklist" below. |
 | `patient_history` | Not checked | |
 | `patient_visit` | Not checked | |
 | `patient_coding` | Not checked | Found 1 corrupted row during column audit (see above) — different issue, not a duplicate |
@@ -595,7 +595,208 @@ already flagged.
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
 | `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
-| `flowsheets` | 🚨 **Confirmed — 63.6% of rows duplicated (916,048,965/1,440,918,933), NOT YET INVESTIGATED** | By far the highest rate found across the whole warehouse. Unresolved whether this is a real data quality issue or legitimate carry-forward charting behavior — top priority for next session, see full write-up above |
+| `flowsheets` | **Confirmed and investigated (2026-08-23) — mechanism still unconfirmed, dedup recommended regardless** | 63.6% of rows duplicated (916,048,965/1,440,918,933) — by far the highest rate in the warehouse. 133,971,114 distinct groups, median size 4, max 323 (a single static field re-emitted 323 times within one encounter — not plausibly a coincidence). Concentrated in `PRE-OP`/`POST-OP` core vitals (`Pulse`, `SpO2`, `Resp`, `BP`, `MAP`, etc.); `INTRA-OP` barely affected. Since `RECORDED_TIME` is part of the exact-match tuple, this is not "same value re-charted over time" (carry-forward) — it's the literal same row appearing multiple times. Two candidate mechanisms, neither confirmed: an export process re-emitting the full unchanged flowsheet state on every subsequent save event, or device-integrated vitals (bedside monitor → Epic) getting duplicated on retry without a dedup key. No public MOVER documentation of this found despite searching. See "Silver-layer design checklist" below for the recommended fix. |
+
+## MRN corruption and patient-level linkage
+
+**Confirmed 2026-08-23.** `patient_information.MRN` splits into two populations:
+
+| Format | Rows | Distinct | Length |
+|---|---|---|---|
+| 16-char lowercase hex (the de-identified surrogate) | 65,690 | 39,659 | 16 |
+| Scientific notation (corrupted) | 38 | 26 | 8–11 |
+
+39,659 + 26 = **39,685**, exactly the patient count reported in the MOVER paper — so the
+corrupted values are real patients, each absent from the clean population, not strays.
+
+**Mechanism (confirmed, not hypothesis).** Every one of the 39,659 clean MRNs contains at
+least one letter `a`–`f`; **zero** all-digit hex16 MRNs survive, against ~21.5 expected by
+chance ((10/16)^16 × 39,659). A CSV/spreadsheet step upstream coerced to a number exactly
+those hashes that happened to contain no letters, and nothing else. Two variants, both
+lossy and irreversible:
+
+- **23 values** — the 16-digit string read as a decimal number, so ≤10^16 → renders `E+14`/`E+15`.
+- **3 values** — the hex parsed as hex, giving its true 64-bit value → `E+18`/`E+19`
+  (`1.45E+19` falls between 2^63 and 2^64, as it must).
+
+**This is not a de-identification leak.** No raw MRN escaped; these are mangled surrogate
+hashes. It is also not an artifact of this pipeline — bronze types `MRN` as `string`, and
+the values are already corrupted in the source CSV. Not documented anywhere in the MOVER
+paper or the known community repos; worth reporting upstream.
+
+**Why the corruption is worse than missing data: it is ambiguous, not blank.** Where
+truncation happened to be consistent it still groups correctly (`9.04E+18` correctly
+gathers one patient's three June–July 2022 cardiac encounters — left heart cath through
+CABG). Where it was not, one patient splits in two: `LOG_ID 250823bea3d3396f` carries both
+`2.75E+15` and `2.75162E+15`. And nothing prevents two genuinely different patients from
+truncating to the same string and being **silently merged**. A false merge produces no
+error and no null — it just quietly fabricates a patient.
+
+**What still works.** `LOG_ID` on all 37 affected encounters is intact hex16 and joins
+normally:
+
+| Table | Rows | Encounters matched |
+|---|---|---|
+| `patient_medications` | 6,750 | 36/37 |
+| `patient_labs` | 9,776 | 35/37 |
+| `patient_post_op_complications` | 84 | 34/37 |
+| `patient_lda` | 167 | 31/37 |
+| `patient_procedure_events` | 195 | 17/37 |
+| `patient_coding` | — | **no `LOG_ID` column — MRN-keyed only, so unreachable** |
+
+**What patient-level linkage buys, and therefore what is lost.** `MRN` is what makes
+several `LOG_ID`s one person. Among clean MRNs: 39,659 patients hold 64,320 surgeries
+(**1.62 each**); **30% of patients have more than one surgery**, and **36,685 surgeries —
+57% of the dataset — belong to repeat patients** (the maximum is 41). Depending on it:
+
+1. **Grouped train/test splitting.** Splitting by encounter puts the same patient on both
+   sides, so a model can memorise the person rather than the physiology and metrics come
+   back optimistic. At 57% of surgeries this is a severe leak, not a rounding error —
+   splits must be grouped by `MRN`. (Gold-layer concern, but it originates here.)
+2. **Longitudinal features** — prior-surgery count, prior complications, lab trajectories
+   from earlier admissions.
+3. **Repeat-event outcomes** — reoperation, readmission, anything defined as "again".
+4. **`patient_coding`** — MRN-keyed, so comorbidity/billing codes are unreachable for
+   these 26 patients.
+5. **Per-patient denominators** — any rate expressed per person rather than per case.
+
+**Open:** the other nine tables have not been scanned for the same pattern. The same 26
+hashes should be mangled identically wherever they appear, and because truncation
+precision varies, corrupted rows may fail to join even to each other.
+`patient_history` / `patient_visit` use lowercase `mrn` and have not been checked for
+whether they carry `LOG_ID` at all — that determines the full blast radius.
+
+## Silver-layer design checklist
+
+Organized by table, each item tagged with which data-quality dimension it belongs to
+(see taxonomy: dedup, missingness, standardization, validity, accuracy, sentinel,
+semantic, casing/join). Items marked **[open]** need further investigation before the
+fix can be finalized — don't implement those blind. Everything here is a silver-layer
+(apply-once, universal) concern; gold-layer concerns (temporal leakage windowing,
+per-model imputation/encoding choices, cohort scoping for a specific question) are
+deliberately out of scope for this checklist — those get designed per model, not here.
+
+**Cross-table / global rules (apply to every table):**
+- [ ] *[casing]* Normalize `LOG_ID`/`MRN` casing everywhere — `mrn` is lowercase in
+      `patient_history`/`patient_visit`, `MRN` uppercase elsewhere. Silent join failures
+      otherwise.
+- [ ] *[standardization]* One universal trim-and-normalize pass over every categorical
+      string column (leading/trailing whitespace + casing variants) — this exact pattern
+      recurred independently in `patient_medications.PRIMARY_ANES_TYPE_NM` ("MAC"),
+      `flowsheets.FLO_NAME`/`UNITS` (at massive scale), `patient_medications
+      .ORDER_STATUS_NM` ("0 " prefix). Handle once as a standard step, not per-column.
+
+**`patient_information`:**
+- [ ] *[dedup, open]* 1,374 excess rows on `LOG_ID` (65,728 total vs. 64,354 distinct —
+      externally confirmed correct via the MOVER paper's own stated surgery count).
+      Row content never actually inspected — check exact-duplicate vs. divergent-content
+      before picking `SELECT DISTINCT` vs. a merge/tie-break rule.
+- [ ] *[accuracy/join]* Add an `mrn_corrupt` boolean flag for the 26 patients / 38 rows
+      whose `MRN` is scientific notation. **Flag, do not drop** — `LOG_ID` is intact, and
+      those encounters carry ~17,000 valid clinical rows across five tables; dropping them
+      would also move the surgery count off the paper's 64,354. Rows so flagged must be
+      excluded from `MRN` grouping, patient-level aggregation, and grouped train/test
+      splits, because the values are ambiguous rather than missing (see "MRN corruption
+      and patient-level linkage" above). Never attempt to repair or back-fill them.
+- [ ] *[validity]* Rename `BIRTH_DATE` → `age_years` (int). Top-coded at 90 per HIPAA
+      safe-harbor (668 rows at the cap) — carry an `age_capped` boolean flag rather than
+      treating 90 as a normal distribution tail.
+- [ ] *[validity]* Parse `HEIGHT` as `F' I(.I)?` (feet, apostrophe, space, inches).
+      2 outlier rows flagged: `LOG_ID bd14c293acb63fcc` (8'2.3", physically implausible —
+      clip/null) vs. `LOG_ID 8944ca07ff7952b2` (7'7", extreme but real — keep).
+- [ ] *[validity]* Convert `WEIGHT` from ounces to a standard unit.
+- [ ] *[standardization]* Trim `PRIMARY_ANES_TYPE_NM` whitespace duplicate ("MAC").
+- [ ] *[semantic]* Document (don't alter) that `PATIENT_CLASS_NM`'s two Inpatient
+      subtypes' labels read backwards from their real clinical meaning — flag clearly
+      for anyone using this field, since the name alone actively misleads.
+- [ ] *[missingness]* `ASA_RATING_C` (10.6% null) and `HOSP_DISCH_TIME` (14 nulls) are
+      both informative/structural missingness, not random — do not blind-impute.
+
+**`patient_history` / `patient_visit`** (share the same `diagnosis_code`/`dx_name` shape):
+- [ ] *[dedup]* **Never checked** — run the full-row duplicate audit on both.
+- [ ] *[sentinel]* `IMO0001` (Epic "No-Map" placeholder) is not a real diagnosis code —
+      treat as null-equivalent, not a valid code, in both tables.
+- [ ] *[missingness]* `diagnosis_code` ~25-30% null while `dx_name` is never null — leave
+      as-is, this is a real billing-timing gap, not a defect.
+- [ ] *[join scope, `patient_visit` only]* 12.1% of `LOG_ID`s don't join back to
+      `patient_information` (broader source population). Document the join caveat
+      explicitly rather than force-joining or silently dropping orphans.
+
+**`patient_coding`:**
+- [ ] *[dedup]* **Never checked.**
+- [ ] *[accuracy]* Drop the 1 fully-corrupted row (`SOURCE_NAME='Final Di'`, truncated
+      mid-word, every other column null).
+- [ ] *[semantic]* Don't trust `SOURCE_NAME`'s code-system claim — "CPT"-labeled rows are
+      actually a mix of true CPT, Category III CPT, and HCPCS Level II. If a clean code
+      system is needed downstream, derive it from the actual code format, not the label.
+
+**`patient_medications`:**
+- [ ] *[dedup]* **Never checked.**
+- [ ] *[standardization]* Trim the `ORDER_STATUS_NM` `"0 "`-prefix variant (9,377 rows).
+- [ ] *[semantic, open]* Classify every `MAR_ACTION_NM` value (Given/Hold/Rate
+      Verify/Rate Change/New Bag/etc.) into "counts as real drug exposure" vs.
+      "logistics event" — open since 2026-08-20, blocks any dose/exposure feature.
+- [ ] *[enrichment, not urgent]* External vocabulary mapping (`MEDICATION_ID`→RxNorm/ATC,
+      `ENC_TYPE_C`→Epic foundation categories) — flagged, not started.
+
+**`patient_post_op_complications`:**
+- [ ] *[dedup]* **Never checked.**
+- [ ] *[semantic]* When using as ML labels, filter out the generic
+      `AN AQI POST-OP COMPLICATIONS` reporting flag (200,139 rows) — it's not a
+      complication class, it dwarfs every real label and will corrupt a naive label
+      distribution.
+- [ ] *[scope]* Prefer `CONTEXT_NAME='ENCOUNTER'` rows (97.8% of real specific-class
+      labels) — `ORDER`/`NOTE` are mostly just the generic flag.
+
+**`patient_lda`:**
+- [ ] *[dedup]* Collapse the 22.9% cross-navigator duplication (rows identical except
+      `Line_Group_Name`) to one canonical row per device event.
+- [ ] *[open]* `[REMOVED]` description-prefix's real meaning still unclear.
+- [ ] *[open]* `placement_instant` vs. `removal_instant` asymmetric null rate
+      uninvestigated.
+
+**`patient_procedure_events`:**
+- [ ] *[dedup]* Collapse the extreme "Mark Now" outlier duplicates (up to 345 exact
+      copies — clear charting glitch).
+- [ ] *[dedup, open]* The size-2-pair majority (93.8% of duplicate groups) is
+      **unresolved bug-vs-convention** — don't dedup these until the drug/dose-field
+      investigation (flagged 2026-08-21) settles whether they're a legitimate
+      one-row-per-item charting pattern.
+- [ ] *[accuracy]* The 2 extreme (~7-day) auto-close outliers are system artifacts, not
+      real durations — exclude from any duration-based feature, don't just clip.
+- [ ] *[not a defect]* `Anesthesia Stop` occurring after `Transported to PACU/ICU`
+      (12.6% of encounters) is legitimate charting lag, confirmed by the user — leave as
+      real data, don't "fix."
+
+**`patient_labs`:**
+- [ ] *[dedup]* Collapse the 0.38% exact duplicates (confirmed literal duplicate lines
+      in the raw source CSV).
+- [ ] *[sentinel]* The `9999999.0` sentinel (13.7% of all rows) needs a derived
+      `is_sentinel`/result-type column, not numeric treatment — it spans 3 different
+      mechanisms (pure-qualitative tests, a small stable censored-value minority, and
+      tests genuinely split between qualitative-screen/quantitative-confirmatory
+      reporting) that may need different downstream handling.
+- [ ] *[standardization]* `Abnormal_Flag` has 5 real values (N/L/H/LL/HH), not the 3 the
+      docs describe — make sure all 5 are handled, not just N/L/H.
+- [ ] *[cleanup]* `ENC_TYPE_NM` is constant (1 distinct value) — zero information,
+      candidate to drop rather than carry forward.
+
+**`flowsheets`** (biggest table, biggest silver impact):
+- [ ] *[dedup]* Collapse the 63.6% duplication (916M/1.44B rows) to 1 row per exact
+      `(LOG_ID, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME, MEAS_VALUE_NUM,
+      MEAS_VALUE_TXT, UNITS)` tuple — see "Duplicate-row audit" above for the mechanism
+      discussion (unconfirmed root cause, but dedup is recommended regardless).
+- [ ] *[standardization]* Trim `FLO_NAME` whitespace duplicate (`"Vital Signs "` alone is
+      27.7% of the entire table) and `UNITS` casing/typo variants (`cmH20`/`cmH2O`,
+      `l/min`/`L/min`, `ml`/`mL`).
+- [ ] *[accuracy]* Fix/null the 6-row CSV-escaping bug (an unescaped quote in a free-text
+      note corrupted `UNITS` for those records).
+- [ ] *[missingness]* `RECORD_TYPE` (12.3% null) is scattered, not systematic — decide
+      null vs. an explicit `UNKNOWN` category based on downstream need.
+- [ ] *[not a defect]* `FLO_DISPLAY_NAME`'s many-to-many relationship with `FLO_NAME` is
+      by design (same measurement reused across care-unit templates) — document, don't
+      "fix." Same for the 0.26% rows with neither `MEAS_VALUE_NUM` nor `MEAS_VALUE_TXT`
+      populated (normal sparse EHR grid behavior).
 
 ## Open items / TODO
 
@@ -608,17 +809,17 @@ already flagged.
       to the paper's 11 complication classes — confirmed, see `patient_post_op_complications`
       section above (11 of 12 values match the paper's Table 4 almost exactly; the 12th is
       a generic AQI reporting flag, not a class)
-- [ ] Design silver layer: consistent `LOG_ID`/`MRN` casing across tables, `HEIGHT`
-      parsed to numeric, `WEIGHT` unit conversion if needed, `BIRTH_DATE` renamed to
-      `age_years`, **trim all categorical string columns as a standard step** — a
-      trailing-whitespace duplicate (same label, one with a trailing space) has now
-      shown up repeatedly across independent tables (`patient_medications`'
-      `PRIMARY_ANES_TYPE_NM` "MAC", `flowsheets`' `FLO_NAME` "Vital Signs" — the latter
-      affecting 27.7% of that table's 1.44B rows) — handle it once in silver, not
-      per-query
+- [ ] Design silver layer — see "Silver-layer design checklist" above for the full,
+      per-table breakdown (dedup, missingness, standardization, validity, sentinel,
+      semantic corrections)
 - [ ] Run the duplicate-row audit across all remaining bronze tables — see "Duplicate-row
       audit" section above. `patient_lda` already confirmed at 22.9% duplicated; every
       other table still needs checking before silver dedup logic is designed
+- [ ] Scan the other nine tables for the same `MRN` scientific-notation corruption found
+      in `patient_information` — see "MRN corruption and patient-level linkage" above.
+      Also determine whether `patient_history` / `patient_visit` (lowercase `mrn`) carry
+      `LOG_ID` at all, since MRN-keyed-only tables are unreachable for the 26 affected
+      patients the way `patient_coding` already is
 - [ ] Design gold-layer feature tables once a specific ML question is chosen (see
       candidate directions in project memory / earlier conversation — real-time
       intraoperative deterioration prediction was the favored direction)
