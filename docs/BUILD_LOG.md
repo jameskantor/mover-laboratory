@@ -362,3 +362,68 @@ continuing to chase the bug:
   question for a dedicated future session, gated on the still-undecided tabular-vs-
   sequence model architecture choice that determines whether GPU training is even
   needed yet.
+
+## 2026-08-23 — Silver build started: `scripts/build_silver.py`, `patient_information` done
+
+**Pattern decision:** silver is a script (`scripts/build_silver.py`), not a notebook —
+matches `ingest.py`'s shape (`--table <name>` / `--all`), so "reproduce this" means
+"run one command" the same way bronze ingestion does. Unlike bronze (append-only,
+resumable per source file), each silver table is **fully recomputed from bronze on every
+run** via `table.overwrite(...)` — simpler and safer than incremental patching for
+derived data. The judgment calls behind each transform live in
+`docs/DATA_DICTIONARY.md`'s "Silver-layer design checklist", cross-referenced from the
+script rather than duplicated in code comments.
+
+**`patient_information` implemented and verified.** The headline piece was finally
+resolving the 1,374 excess-`LOG_ID` rows found back on 2026-08-21 (row content was never
+actually inspected until this session): 1,364 exact duplicates + 4 whitespace/wording
+variants collapse via `SELECT DISTINCT` after normalizing; of the remaining 7 truly
+divergent `LOG_ID`s, 3 are real cross-patient `LOG_ID` collisions (kept, both rows,
+flagged `log_id_collision` — `LOG_ID` is genuinely not unique for these), 1 is an
+`MRN`-corruption artifact (collapsed, flagged `mrn_corrupt`), and 3 are genuine
+same-encounter value conflicts (tie-broken via a fixed `ORDER BY`, flagged
+`has_conflicting_duplicate`). Also implemented: the `mrn_corrupt` flag from the MRN
+corruption investigation, `BIRTH_DATE`→`age_years`+`age_capped`, `HEIGHT`→`height_in`
+(with the one implausible-outlier row nulled), `WEIGHT`→`weight_kg`, and a global
+string-trim pass. Production run: 64,357 rows / **64,354 distinct `LOG_ID` — matches the
+MOVER paper's stated surgery count exactly** — `mrn_corrupt`=37, `log_id_collision`=6,
+`has_conflicting_duplicate`=3, all matching the values validated by hand beforehand.
+Also added a `silver` Iceberg namespace to `scripts/catalog.py` (created alongside
+`bronze` if missing) and `scripts/silver_schemas.py` for silver table schemas, mirroring
+`schemas.py`'s bronze pattern.
+
+Remaining tables not yet built — see `docs/DATA_DICTIONARY.md`'s checklist for what's
+left per table, several still gated on duplicate-row audits that haven't been run yet
+(`patient_history`, `patient_visit`, `patient_coding`, `patient_medications`,
+`patient_post_op_complications`).
+
+## 2026-08-24 — Silver build: `patient_lda` done
+
+Second table implemented (`build_patient_lda` in `scripts/build_silver.py`), the other
+one whose dedup rule was already fully resolved going in. Collapses the 22.9%
+cross-navigator duplication found during the column audit — the same physical device
+charted under two LDA navigator categories at once (e.g. `Drain` + `Urinary Drainage`
+for one catheter), identical on every other column. Grouped on every column except
+`Line_Group_Name` (after trimming strings), one canonical row per real device event;
+renamed `Line_Group_Name` → `line_group_names` (a `list<string>` holding every navigator
+category the device was filed under, rather than duplicating the row) with a
+`multi_navigator` boolean flagging which rows this collapsed.
+
+Needed one addition to the silver-schema machinery: `scripts/silver_schemas.py`'s
+`_schema()` helper only handled flat field types, since `patient_information` didn't
+need anything nested. Reworked it to take a shared `_IdGen` field-id counter so a column
+can be a callable that mints its own nested element id — `ListType` needs one distinct
+from the column's own field id. `build_silver.py`'s `arrow_type_for()` got the matching
+`ListType` → `pa.list_(pa.string())` case.
+
+Production run: 412,312 rows (from 465,801 bronze), `multi_navigator`=53,218. Row count
+lands close to but not exactly the 106,534-duplicated/53,174-groups figure from the
+original column audit — that estimate didn't trim whitespace first, so a handful of
+near-duplicate groups that differed only by stray whitespace get correctly merged here
+that the untrimmed scan had counted as distinct. Verified by reading the written table
+back and spot-checking sample `multi_navigator` rows' `line_group_names` lists.
+
+Next per the checklist: every other table is gated on a duplicate-row audit that hasn't
+been run yet (`patient_history`, `patient_visit`, `patient_coding`, `patient_medications`,
+`patient_post_op_complications`) — one of those audits is the natural next step before
+more of silver can be built.

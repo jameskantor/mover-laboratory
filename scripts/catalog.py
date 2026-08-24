@@ -30,6 +30,8 @@ def get_catalog():
             "warehouse": f"file://{WAREHOUSE_DIR}",
         },
     )
-    if "bronze" not in [ns[0] for ns in catalog.list_namespaces()]:
-        catalog.create_namespace("bronze")
+    existing = [ns[0] for ns in catalog.list_namespaces()]
+    for ns in ("bronze", "silver"):
+        if ns not in existing:
+            catalog.create_namespace(ns)
     return catalog

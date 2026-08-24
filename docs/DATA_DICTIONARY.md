@@ -660,11 +660,97 @@ several `LOG_ID`s one person. Among clean MRNs: 39,659 patients hold 64,320 surg
    these 26 patients.
 5. **Per-patient denominators** — any rate expressed per person rather than per case.
 
-**Open:** the other nine tables have not been scanned for the same pattern. The same 26
-hashes should be mangled identically wherever they appear, and because truncation
-precision varies, corrupted rows may fail to join even to each other.
-`patient_history` / `patient_visit` use lowercase `mrn` and have not been checked for
-whether they carry `LOG_ID` at all — that determines the full blast radius.
+**Confirmed 2026-08-23 — full-warehouse scan complete.** The same corruption reappears,
+independently, in five of the ten tables (not shared from one broken master file — each
+table's export pipeline mangled its own copy):
+
+| Table | Corrupted? |
+|---|---|
+| `patient_coding` | ✅ 386 rows / 14 distinct |
+| `patient_information` | ✅ 38 rows / 26 distinct |
+| `patient_lda` | ✅ 172 rows / 24 distinct |
+| `patient_post_op_complications` | ✅ 86 rows / 23 distinct |
+| `patient_procedure_events` | ✅ 209 rows / 15 distinct |
+| `patient_history`, `patient_labs`, `patient_medications`, `patient_visit`, `flowsheets` | clean |
+
+Bucketing the corrupted values by magnitude (truncation precision varies table to table,
+so exact string matching undercounts) confirms it's the same ~25 patients recurring
+across all five affected tables, not five independent populations. `patient_history` has
+no `LOG_ID` column at all (MRN-only); `patient_visit` does carry `LOG_ID` and is clean.
+
+**Recoverable for most of these patients.** `patient_history` stores 22 of the affected
+MRNs as correct, full-precision 16-digit strings (never coerced to scientific notation —
+this table just wasn't vulnerable to the bug) that decode exactly to the same corrupted
+buckets found elsewhere. So a silver-layer join through `patient_history` (`MRN` →
+correct 16-hex string) can repair `patient_information` / `patient_lda` / `patient_coding`
+/ `patient_post_op_complications` / `patient_procedure_events` for 22 of the ~25 patients,
+restoring true patient-level linkage instead of only flagging it broken. **Not yet
+implemented** — `build_silver.py` still only flags `mrn_corrupt`, it doesn't repair via
+this recovery path. The remaining ~3 patients (the `E+18`/`E+19` cases, which are
+letter-containing hex parsed as hex rather than all-digit-as-decimal — see mechanism
+above) aren't recoverable this way and need a separate check.
+
+## LOG_ID collisions across different patients
+
+**Confirmed 2026-08-23.** Of `patient_information`'s 7 truly-divergent duplicate
+`LOG_ID`s (see the dedup rule below), 3 shared a `LOG_ID` across two rows with different
+`MRN`. Initial read of `patient_information` alone made this look like it could be a
+random 64-bit hash collision — implausible at ~65K rows, but not ruled out by that table
+alone. **Cross-checking against every other table's real clinical data settles it, and
+the three cases split into two entirely different phenomena:**
+
+**`ebfbb4fcfd39fdff` and `c468eb4fb4f54ddb` — genuine collisions between two real,
+distinct patients.** Both `LOG_ID`s carry substantial, independently-verifiable clinical
+data for **both** `MRN`s, a year apart:
+
+| LOG_ID | MRN | flowsheet rows | date range |
+|---|---|---|---|
+| `ebfbb4fcfd39fdff` | `3c573ad3…` | 10,841 | 2020-06-11 → 06-22 |
+| `ebfbb4fcfd39fdff` | `d592dd4d…` | 3,876 | 2021-03-20 only |
+| `c468eb4f…` | `3c573ad3…` | 10,841 | 2020-06-11 → 06-22 |
+| `c468eb4f…` | `d592dd4d…` | 3,876 | 2021-03-20 only |
+
+Both `LOG_ID` values carry real bedside-vitals charting for both `MRN`s, a year apart —
+this is two humans' actual data, not a merge artifact on one chart. It also explains the
+row-content pattern cleanly: each of these two real patients had an initial op and a
+reop 3 days later within one admission (`ebfbb4fcfd39fdff`=initial, `c468eb4f…`=reop for
+*both* patients) — vitals were charted continuously through the stay, so the same
+admission's flowsheet rows legitimately attach to both of that patient's `LOG_ID`s. Not a
+random 64-bit collision — the same two patients collide at *matched sequence positions*
+(both patients' 1st op share one `LOG_ID`, both patients' reop share a different one),
+which only makes sense if `LOG_ID` isn't purely random. Working theory, not confirmed:
+MOVER's de-identification pipeline derives `LOG_ID` at least partly from something like
+"clinical-similarity cohort + encounter-sequence position," so two patients in the same
+cohort at the same position in their own encounter sequence can land on the same value.
+This is a real defect in MOVER's `LOG_ID` generation, worth reporting upstream — not
+sampling noise, and not something this pipeline can fix at the source.
+
+**`0c6b137659f5df02` — not a collision. A partial-duplication artifact.** The second
+`MRN` (`fc63c830038a1f83`) has **zero rows in every encounter-level clinical table in the
+warehouse** — no labs, no meds, no flowsheets, no procedure events, no complications, no
+LDA, no coding. Every real clinical trace for this `LOG_ID` belongs to the first `MRN`
+(`18d889ebcda81db9`) alone. Digging into what *does* exist for the phantom `MRN`:
+
+- `patient_visit`: both `MRN`s show the exact same single row on this `LOG_ID` —
+  byte-for-byte identical `dx_name` ("Acute infective endocarditis...").
+- `patient_history`: the phantom `MRN` has 4 diagnoses (`255.9 Adrenal mass`,
+  endocarditis ×2, `289.59 Splenic abscess`). The real `MRN` has those exact same 4,
+  **plus a 5th** (`786.50 Chest pain`) the phantom is missing.
+
+So the phantom `MRN` isn't an independent patient — it's a **strict subset copy** of the
+real patient's diagnosis history, missing one row, attached to a fabricated `MRN` and a
+surgery date shifted exactly two months later (`2020-11-09` vs the real `2020-09-06`),
+with zero corroborating activity anywhere else. Categorically different from the two
+genuine collisions above, which both had substantial independent clinical footprints.
+
+**Fix — proposed, not yet implemented in `build_silver.py`.** Reclassify
+`0c6b137659f5df02`: drop the `fc63c830038a1f83` row (no clinical substance), keep only
+`18d889ebcda81db9` (real data). That would leave **2 true collision `LOG_ID`s (4 rows —
+`ebfbb4fcfd39fdff`/`c468eb4fb4f54ddb`)** instead of 3 (6 rows), and total silver row
+count would drop by 1 (64,356 instead of 64,357; distinct `LOG_ID` stays 64,354 either
+way). `log_id_collision` count would drop from 6 to 4. Not applied yet — this is a report
+of the finding and the recommended fix, not a code change; `build_silver.py` still
+treats all 3 as collisions and keeps all 6 rows as of this writing.
 
 ## Silver-layer design checklist
 
@@ -686,31 +772,50 @@ deliberately out of scope for this checklist — those get designed per model, n
       `flowsheets.FLO_NAME`/`UNITS` (at massive scale), `patient_medications
       .ORDER_STATUS_NM` ("0 " prefix). Handle once as a standard step, not per-column.
 
-**`patient_information`:**
-- [ ] *[dedup, open]* 1,374 excess rows on `LOG_ID` (65,728 total vs. 64,354 distinct —
-      externally confirmed correct via the MOVER paper's own stated surgery count).
-      Row content never actually inspected — check exact-duplicate vs. divergent-content
-      before picking `SELECT DISTINCT` vs. a merge/tie-break rule.
-- [ ] *[accuracy/join]* Add an `mrn_corrupt` boolean flag for the 26 patients / 38 rows
-      whose `MRN` is scientific notation. **Flag, do not drop** — `LOG_ID` is intact, and
-      those encounters carry ~17,000 valid clinical rows across five tables; dropping them
-      would also move the surgery count off the paper's 64,354. Rows so flagged must be
-      excluded from `MRN` grouping, patient-level aggregation, and grouped train/test
-      splits, because the values are ambiguous rather than missing (see "MRN corruption
-      and patient-level linkage" above). Never attempt to repair or back-fill them.
-- [ ] *[validity]* Rename `BIRTH_DATE` → `age_years` (int). Top-coded at 90 per HIPAA
-      safe-harbor (668 rows at the cap) — carry an `age_capped` boolean flag rather than
-      treating 90 as a normal distribution tail.
-- [ ] *[validity]* Parse `HEIGHT` as `F' I(.I)?` (feet, apostrophe, space, inches).
-      2 outlier rows flagged: `LOG_ID bd14c293acb63fcc` (8'2.3", physically implausible —
-      clip/null) vs. `LOG_ID 8944ca07ff7952b2` (7'7", extreme but real — keep).
-- [ ] *[validity]* Convert `WEIGHT` from ounces to a standard unit.
-- [ ] *[standardization]* Trim `PRIMARY_ANES_TYPE_NM` whitespace duplicate ("MAC").
+**`patient_information`:** — **implemented in `scripts/build_silver.py::build_patient_information`, 2026-08-23.**
+- [x] *[dedup]* 1,374 excess rows on `LOG_ID` resolved. Row content was inspected: 1,364
+      were exact duplicates (trivial `SELECT DISTINCT`) plus 4 whitespace/wording-only
+      variants (collapse the same way after normalizing). Of the remaining 7 genuinely
+      divergent `LOG_ID`s: **3 are real collisions** between different patients (`MRN`
+      and every other column differ) — both rows kept, flagged `log_id_collision`,
+      **`LOG_ID` is not a unique key for these 6 rows**; **1 is an `MRN`-corruption
+      artifact** (`MRN` differs but everything else is identical, and both `MRN` values
+      are the scientific-notation kind) — collapsed to 1 row, flagged `mrn_corrupt`;
+      **3 are genuine same-encounter conflicting values** (e.g. `DISCH_DISP_C` 15 vs 20)
+      — tie-broken to 1 row via a fixed, reproducible `ORDER BY` over every column,
+      flagged `has_conflicting_duplicate`. Verified in production output: 64,357 rows /
+      64,354 distinct `LOG_ID` (matches the paper exactly), `mrn_corrupt`=37,
+      `log_id_collision`=6, `has_conflicting_duplicate`=3.
+  - [ ] *[correction, open]* Of the 3 `log_id_collision` cases, only 2
+        (`ebfbb4fcfd39fdff`/`c468eb4fb4f54ddb`) are genuine cross-patient collisions —
+        confirmed via independent clinical data (real flowsheets for both `MRN`s). The
+        3rd, `0c6b137659f5df02`, is a partial-duplication artifact, not a real second
+        patient — its second `MRN` has zero footprint in any encounter-level table. See
+        "LOG_ID collisions across different patients" above for the full investigation.
+        **Fix not yet applied**: `build_silver.py` should drop `0c6b137659f5df02`'s
+        `fc63c830038a1f83` row and keep only `18d889ebcda81db9`, dropping
+        `log_id_collision` from 6 rows to 4 and total silver rows from 64,357 to 64,356.
+- [x] *[accuracy/join]* `mrn_corrupt` boolean flag added, not repaired. 37 rows flagged
+      (38 minus the 1 collapsed by the dedup rule above). Any patient-level grouping/join
+      downstream must filter or otherwise account for these rows — see "MRN corruption
+      and patient-level linkage" above.
+- [x] *[validity]* `BIRTH_DATE` → `age_years` (int), with `age_capped` boolean
+      (`age_years = 90`) — 642 rows in the final 64,357, down slightly from bronze's 668
+      because some capped-age rows were among the collapsed exact duplicates.
+- [x] *[validity]* `HEIGHT` parsed to `height_in` (float, total inches) via
+      `F' I(.I)?` regex. `LOG_ID bd14c293acb63fcc` (8'2.3", physically implausible) is
+      explicitly nulled; `LOG_ID 8944ca07ff7952b2` (7'7"/91in) parses through unchanged
+      and is kept — verified as the table's actual max after the build.
+- [x] *[validity]* `WEIGHT` → `weight_kg` (`WEIGHT * 0.0283495`). Post-build range
+      23.0–296.3 kg, avg 79.1 kg — plausible for a mixed adult/peds surgical population.
+- [x] *[standardization]* `PRIMARY_ANES_TYPE_NM` (and every other string column) trimmed.
 - [ ] *[semantic]* Document (don't alter) that `PATIENT_CLASS_NM`'s two Inpatient
       subtypes' labels read backwards from their real clinical meaning — flag clearly
-      for anyone using this field, since the name alone actively misleads.
+      for anyone using this field, since the name alone actively misleads. Column is
+      carried through to silver unchanged; the doc note itself is still owed.
 - [ ] *[missingness]* `ASA_RATING_C` (10.6% null) and `HOSP_DISCH_TIME` (14 nulls) are
-      both informative/structural missingness, not random — do not blind-impute.
+      both informative/structural missingness, not random — do not blind-impute. No
+      code change needed here, just a standing rule for gold-layer feature building.
 
 **`patient_history` / `patient_visit`** (share the same `diagnosis_code`/`dx_name` shape):
 - [ ] *[dedup]* **Never checked** — run the full-row duplicate audit on both.
@@ -748,12 +853,20 @@ deliberately out of scope for this checklist — those get designed per model, n
 - [ ] *[scope]* Prefer `CONTEXT_NAME='ENCOUNTER'` rows (97.8% of real specific-class
       labels) — `ORDER`/`NOTE` are mostly just the generic flag.
 
-**`patient_lda`:**
-- [ ] *[dedup]* Collapse the 22.9% cross-navigator duplication (rows identical except
-      `Line_Group_Name`) to one canonical row per device event.
-- [ ] *[open]* `[REMOVED]` description-prefix's real meaning still unclear.
+**`patient_lda`:** — **implemented in `scripts/build_silver.py::build_patient_lda`, 2026-08-24.**
+- [x] *[dedup]* Collapsed the cross-navigator duplication: grouped on every column except
+      `Line_Group_Name` (after trimming), one canonical row per real device event.
+      Renamed `Line_Group_Name` → `line_group_names` (`list<string>`), holding every
+      navigator category the device was filed under instead of duplicating the row; added
+      `multi_navigator` boolean flag for rows this collapsed. Verified in production
+      output: 412,312 rows (from 465,801 bronze — a 53,489-row reduction, close to but not
+      exactly the 106,534/53,174 estimated during the column audit, since trimming
+      whitespace here merges a handful of near-duplicate groups the earlier untrimmed scan
+      counted separately), `multi_navigator`=53,218.
+- [ ] *[open]* `[REMOVED]` description-prefix's real meaning still unclear. Column carried
+      through to silver unchanged.
 - [ ] *[open]* `placement_instant` vs. `removal_instant` asymmetric null rate
-      uninvestigated.
+      uninvestigated. Columns carried through to silver unchanged.
 
 **`patient_procedure_events`:**
 - [ ] *[dedup]* Collapse the extreme "Mark Now" outlier duplicates (up to 345 exact
