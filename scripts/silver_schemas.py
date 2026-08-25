@@ -106,4 +106,18 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_visit": _schema([
+        ("LOG_ID", StringType(), True),
+        ("mrn", StringType(), True),
+        ("diagnosis_code", StringType(), False),
+        ("dx_name", StringType(), False),
+        # Unlike patient_history, this repeats WITHIN one encounter (57% of bronze rows),
+        # grep-verified real in the source CSV -- likely one row per clinical note/document
+        # that reiterates the visit's diagnosis list. Same treatment as patient_history:
+        # collapsed to one row per (LOG_ID, mrn, diagnosis_code, dx_name), repeat count
+        # kept explicitly. Collapses 219,257 bronze rows to 131,455 distinct groups.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

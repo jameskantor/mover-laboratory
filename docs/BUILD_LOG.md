@@ -461,3 +461,25 @@ count exactly, the known 104× group collapses correctly on verification.
 Next per the checklist: `patient_visit`, `patient_coding`, `patient_medications`, and
 `patient_post_op_complications` still each need their own duplicate-row audit before
 more of silver can be built.
+
+## 2026-08-25 — Silver build: `patient_visit` done
+
+Ran the `patient_visit` duplicate-row audit — 57% of bronze rows (125,405/219,257)
+duplicated on `(LOG_ID, mrn, diagnosis_code, dx_name)`. Looked like the same shape as
+`patient_history` at first glance (same columns), but the mechanism is different: this
+table has `LOG_ID`, and the duplication happens **within one encounter** rather than
+across encounters — the largest group is one `LOG_ID` with 756 rows / 27 distinct
+diagnoses, one diagnosis (`Hemorrhagic shock (CMS-HCC)`) repeated 54 times. Grep-verified
+against the raw source CSV (54 literal matching lines) before trusting it, same as
+`patient_history`. Working theory: one row per clinical note/document within the
+encounter that reiterates the visit's diagnosis list — can't confirm further since
+bronze carries no note/document id for this table.
+
+Applied the same fix as `patient_history`: `build_patient_visit` in
+`scripts/build_silver.py` collapses to one row per `(LOG_ID, mrn, diagnosis_code,
+dx_name)`, keeping the repeat count as `n_occurrences`. Production run: 131,455 rows
+(from 219,257 bronze), `sum(n_occurrences)` matches bronze exactly, known 54× group
+collapses correctly on verification.
+
+Next: `patient_coding`, `patient_medications`, and `patient_post_op_complications` still
+need their own duplicate-row audits.

@@ -271,10 +271,45 @@ def build_patient_history(catalog):
     write_silver_table(catalog, "patient_history", df)
 
 
+# --- patient_visit ------------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_visit):
+# 57% of bronze rows duplicate on (LOG_ID, mrn, diagnosis_code, dx_name) -- grep-verified
+# real in the raw source CSV. Different mechanism than patient_history: this repeats
+# WITHIN one encounter (one LOG_ID can carry 20+ copies of the same diagnosis), likely one
+# row per clinical note/document that reiterates the visit's diagnosis list -- not
+# resolvable further without a note id, which bronze doesn't have. Same treatment as
+# patient_history: collapsed to one row per group, repeat count kept as n_occurrences.
+_PATIENT_VISIT_SQL = """
+SELECT LOG_ID, mrn, diagnosis_code, dx_name, count(*) AS n_occurrences
+FROM read_parquet({files})
+GROUP BY LOG_ID, mrn, diagnosis_code, dx_name
+"""
+
+
+def build_patient_visit(catalog):
+    files = bronze_files(catalog, "patient_visit")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_VISIT_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 131455  # distinct (LOG_ID, mrn, diagnosis_code, dx_name) groups, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_visit: expected {n_expected:,} distinct groups, got {len(df):,} "
+            "-- dedup logic no longer matches the validated shape, stopping before write."
+        )
+    log.info(f"[patient_visit] {len(df):,} rows (from {n_bronze:,} bronze), "
+             f"max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_visit", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
     "patient_history": build_patient_history,
+    "patient_visit": build_patient_visit,
 }
 
 
