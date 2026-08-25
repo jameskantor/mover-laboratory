@@ -91,4 +91,19 @@ SILVER_TABLES = {
         ("multi_navigator", BooleanType(), False),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_history": _schema([
+        ("mrn", StringType(), True),
+        ("diagnosis_code", StringType(), False),
+        ("dx_name", StringType(), False),
+        # Bronze has no encounter id for this table, so a diagnosis gets re-exported once
+        # per clinical encounter that patient had -- confirmed real (grep-verified against
+        # the raw source CSV), scaling ~1:1 with each patient's surgery count in
+        # patient_information (1.09x for 1-surgery patients up to 52x for a 41-surgery
+        # patient). Collapsed to one row per (mrn, diagnosis_code, dx_name), with the
+        # repeat count kept explicitly here instead of left as an implicit row count.
+        # Collapses 970,741 bronze rows to 437,721 distinct (mrn, diagnosis_code, dx_name).
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

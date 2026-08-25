@@ -235,9 +235,46 @@ def build_patient_lda(catalog):
     write_silver_table(catalog, "patient_lda", df)
 
 
+# --- patient_history --------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_history):
+# 76% of bronze rows are "duplicates" of (mrn, diagnosis_code, dx_name) -- confirmed real
+# (grep-verified against the raw source CSV, not an ingestion artifact) and mechanistic,
+# not a data-quality bug: this table has no encounter id, so a chronic problem-list
+# diagnosis gets re-exported once per clinical encounter that patient had. Duplication
+# ratio scales ~1:1 with each patient's surgery count in patient_information (1.09x for a
+# 1-surgery patient up to 52x for the one 41-surgery patient). Collapsed to one row per
+# (mrn, diagnosis_code, dx_name), keeping the repeat count explicitly as n_occurrences
+# rather than leaving it as an implicit, easy-to-lose row count.
+_PATIENT_HISTORY_SQL = """
+SELECT mrn, diagnosis_code, dx_name, count(*) AS n_occurrences
+FROM read_parquet({files})
+GROUP BY mrn, diagnosis_code, dx_name
+"""
+
+
+def build_patient_history(catalog):
+    files = bronze_files(catalog, "patient_history")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_HISTORY_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 437721  # distinct (mrn, diagnosis_code, dx_name) groups, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_history: expected {n_expected:,} distinct groups, got {len(df):,} "
+            "-- dedup logic no longer matches the validated shape, stopping before write."
+        )
+    log.info(f"[patient_history] {len(df):,} rows (from {n_bronze:,} bronze), "
+             f"max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_history", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
+    "patient_history": build_patient_history,
 }
 
 

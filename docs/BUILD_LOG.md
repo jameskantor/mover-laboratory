@@ -423,7 +423,41 @@ near-duplicate groups that differed only by stray whitespace get correctly merge
 that the untrimmed scan had counted as distinct. Verified by reading the written table
 back and spot-checking sample `multi_navigator` rows' `line_group_names` lists.
 
-Next per the checklist: every other table is gated on a duplicate-row audit that hasn't
-been run yet (`patient_history`, `patient_visit`, `patient_coding`, `patient_medications`,
-`patient_post_op_complications`) — one of those audits is the natural next step before
+## 2026-08-25 — Silver build: `patient_history` done; duplicate-row mechanism confirmed real
+
+Ran the `patient_history` duplicate-row audit that's been outstanding since the
+bronze-layer column audit. **76% of rows (734,073/970,741) were duplicates on
+`(mrn, diagnosis_code, dx_name)`** — initially looked alarming (user's reaction: "I
+can't believe these rows are all dupes — all columns are exactly the same?"), so
+verified rather than assumed before building anything.
+
+Investigation: duplication ratio scales almost exactly 1:1 with how many surgeries that
+patient has in `patient_information` (1.09× for a 1-surgery patient up to 52× for the
+single 41-surgery patient) — a smoking gun, since this table has no encounter id at all
+(no `LOG_ID`, no date). Each diagnosis on a patient's problem list gets re-recorded once
+per clinical encounter, so a chronic diagnosis on a heavily-operated patient legitimately
+appears dozens of times. Confirmed this isn't an ingestion bug by grepping the raw source
+CSV directly for the largest offender (`mrn 1bb09d5761661c7d` / `Cervical cancer, FIGO
+stage IIB (CMS-HCC)`, 104 occurrences) — found exactly 104 literal matching lines in
+`patient_history.csv`, so the duplication is genuinely in MOVER's exported data, not
+introduced by this pipeline. Real EHR problem-list behavior, not a data-quality defect.
+
+Side finding along the way: `diagnosis_code` is not a stable key on its own (e.g.
+`V45.89` maps to 489 different `dx_name` values — it's a generic "postprocedural status"
+code) — `dx_name` carries the real specificity, worth knowing for anyone joining on
+`diagnosis_code` alone later.
+
+**Implementation** (`build_patient_history` in `scripts/build_silver.py`): collapsed to
+one row per `(mrn, diagnosis_code, dx_name)`, keeping the repeat count explicitly as
+`n_occurrences` rather than leaving it implicit in row count (loses information silently
+if someone later drops to `SELECT DISTINCT`). One correction caught during
+implementation: the initially-assumed target of "~236,668 rows" (from an earlier
+back-of-envelope estimate) turned out to be the count of never-duplicated singleton
+groups only, not the true distinct-group total — the actual correct figure, confirmed by
+a fresh live query before hardcoding the validation assertion, is **437,721**. Production
+run: 437,721 rows (from 970,741 bronze), `sum(n_occurrences)` matches the bronze row
+count exactly, the known 104× group collapses correctly on verification.
+
+Next per the checklist: `patient_visit`, `patient_coding`, `patient_medications`, and
+`patient_post_op_complications` still each need their own duplicate-row audit before
 more of silver can be built.

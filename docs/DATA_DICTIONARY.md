@@ -587,7 +587,7 @@ already flagged.
 | Table | Dedup status | Notes |
 |---|---|---|
 | `patient_information` | **Gap confirmed, externally corroborated, row content not yet inspected** | 65,728 total rows but only 64,354 distinct `LOG_ID` (1,374 excess rows). Found incidentally during the `patient_procedure_events` sequencing analysis (2026-08-21). **2026-08-23: externally confirmed 64,354 is the correct count** — the official MOVER paper's own stated surgery count for the EPIC dataset is 64,354, matching the distinct-`LOG_ID` count exactly, not the raw row count. Still not checked whether the 1,374 excess rows are exact duplicates or genuinely divergent content sharing a `LOG_ID` — see "Silver-layer design checklist" below. |
-| `patient_history` | Not checked | |
+| `patient_history` | **Confirmed and investigated (2026-08-25) — real, mechanistic, dedup implemented** | 76% of rows (734,073/970,741) duplicated on `(mrn, diagnosis_code, dx_name)`. No encounter id in this table, so a chronic diagnosis re-exports once per clinical encounter — ratio scales ~1:1 with each patient's surgery count (1.09× to 52×), grep-confirmed real at the source. Silver collapses to 437,721 rows with an `n_occurrences` count — see "Silver-layer design checklist" below. |
 | `patient_visit` | Not checked | |
 | `patient_coding` | Not checked | Found 1 corrupted row during column audit (see above) — different issue, not a duplicate |
 | `patient_medications` | Not checked | Column audit found an `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue — different issue, not confirmed as row duplication |
@@ -817,15 +817,38 @@ deliberately out of scope for this checklist — those get designed per model, n
       both informative/structural missingness, not random — do not blind-impute. No
       code change needed here, just a standing rule for gold-layer feature building.
 
-**`patient_history` / `patient_visit`** (share the same `diagnosis_code`/`dx_name` shape):
-- [ ] *[dedup]* **Never checked** — run the full-row duplicate audit on both.
+**`patient_history`:** — **dedup implemented in `scripts/build_silver.py::build_patient_history`, 2026-08-25.**
+- [x] *[dedup]* 76% of bronze rows (734,073 of 970,741) were "duplicates" of
+      `(mrn, diagnosis_code, dx_name)`. **Investigated, not a data-quality bug —
+      confirmed real and mechanistic.** This table carries no encounter id, so a
+      chronic problem-list diagnosis gets re-exported once per clinical encounter that
+      patient had; duplication ratio scales ~1:1 with each patient's surgery count in
+      `patient_information` (1.09× for a 1-surgery patient, up to 52× for the one
+      41-surgery patient — the single largest group, `mrn 1bb09d5761661c7d` /
+      `Cervical cancer, FIGO stage IIB (CMS-HCC)`, appears exactly 104 times).
+      Grep-verified a real example (104 literal matching lines) against the raw source
+      CSV before trusting the finding — confirmed present at the source, not an
+      ingestion artifact. Collapsed to one row per `(mrn, diagnosis_code, dx_name)`,
+      with the repeat count kept explicitly as `n_occurrences` rather than left as an
+      implicit, easy-to-lose row count. Verified in production output: 437,721 rows
+      (from 970,741 bronze), `sum(n_occurrences)` matches the bronze row count exactly,
+      known 104× group collapses correctly.
 - [ ] *[sentinel]* `IMO0001` (Epic "No-Map" placeholder) is not a real diagnosis code —
-      treat as null-equivalent, not a valid code, in both tables.
+      treat as null-equivalent, not a valid code. Not yet applied to silver output.
 - [ ] *[missingness]* `diagnosis_code` ~25-30% null while `dx_name` is never null — leave
       as-is, this is a real billing-timing gap, not a defect.
-- [ ] *[join scope, `patient_visit` only]* 12.1% of `LOG_ID`s don't join back to
-      `patient_information` (broader source population). Document the join caveat
-      explicitly rather than force-joining or silently dropping orphans.
+
+**`patient_visit`** (shares the same `diagnosis_code`/`dx_name` shape as `patient_history`,
+but is encounter-level via `LOG_ID` rather than patient-level-only — has not been checked
+for the same re-export-per-encounter duplication mechanism):
+- [ ] *[dedup]* **Never checked.**
+- [ ] *[sentinel]* `IMO0001` (Epic "No-Map" placeholder) is not a real diagnosis code —
+      treat as null-equivalent, not a valid code.
+- [ ] *[missingness]* `diagnosis_code` ~25-30% null while `dx_name` is never null — leave
+      as-is, this is a real billing-timing gap, not a defect.
+- [ ] *[join scope]* 12.1% of `LOG_ID`s don't join back to `patient_information` (broader
+      source population). Document the join caveat explicitly rather than force-joining
+      or silently dropping orphans.
 
 **`patient_coding`:**
 - [ ] *[dedup]* **Never checked.**
