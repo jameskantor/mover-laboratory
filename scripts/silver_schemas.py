@@ -177,4 +177,28 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_post_op_complications": _schema([
+        ("LOG_ID", StringType(), True),
+        ("MRN", StringType(), True),
+        ("Element_Name", StringType(), False),
+        ("CONTEXT_NAME", StringType(), False),
+        ("Element_abbr", StringType(), False),
+        ("SMRTDTA_ELEM_VALUE", StringType(), False),
+        # 79% of bronze rows duplicated -- 98% of that is the generic
+        # `AN AQI POST-OP COMPLICATIONS` reporting flag (SMRTDTA_ELEM_VALUE always null,
+        # up to 49x per encounter), same re-emission-per-note mechanism confirmed for
+        # patient_visit (this table has LOG_ID yet still duplicates heavily within one
+        # encounter; CONTEXT_NAME='NOTE' is one of three contexts, consistent with "one
+        # row per document/note referencing this element"). A small remainder (21 groups,
+        # 42 rows) of real, non-null complication values duplicate the same way -- grep-
+        # verified real against the raw source CSV, not an ingestion artifact. Collapsed
+        # to one row per (LOG_ID, MRN, Element_Name, CONTEXT_NAME, Element_abbr,
+        # SMRTDTA_ELEM_VALUE), repeat count kept as n_occurrences. Unlike
+        # patient_medications there is no dose/quantity column at risk here -- a
+        # complication's presence doesn't need multiplying into a total.
+        # Collapses 203,945 bronze rows to 84,776 distinct groups.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

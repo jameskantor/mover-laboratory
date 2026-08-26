@@ -591,7 +591,7 @@ already flagged.
 | `patient_visit` | **Confirmed and investigated (2026-08-25) — real, dedup implemented** | 57% of rows (125,405/219,257) duplicated on `(LOG_ID, mrn, diagnosis_code, dx_name)`, but *within* one encounter, not across encounters like `patient_history` — likely one row per clinical note reiterating the diagnosis list. Grep-confirmed real at the source. Silver collapses to 131,455 rows with an `n_occurrences` count. |
 | `patient_coding` | **Confirmed and investigated (2026-08-26) — real, dedup implemented** | 55% of rows (1,124,044/2,033,948) duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE)` — same no-encounter-id re-export-per-encounter mechanism as `patient_history`. Grep-confirmed real at the source (612× top group). Silver collapses to 1,244,633 rows with an `n_occurrences` count. Separately, 1 corrupted row found during the column audit (see above) — different issue, not part of this duplication. |
 | `patient_medications` | **Confirmed and investigated (2026-08-27) — export artifact, dedup implemented** | Only 1.24% of rows (345,530/27,961,524) duplicated. Full investigation (see "MAR duplicate-row investigation" above) confirmed this is an export/ETL artifact — contiguous multi-day duplicate blocks, one-time actions repeating at the identical second, the pattern recurring identically across one patient's multiple encounters — not charting noise and not periodic infusion-continuation checks. Silver collapses to `n_occurrences` (27,773,144 rows), matching `patient_history`/`patient_visit`/`patient_coding`'s treatment; never multiply `ADMIN_SIG` by `n_occurrences` for a dose/fluid total. Separately still open: the `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue. |
-| `patient_post_op_complications` | Not checked | |
+| `patient_post_op_complications` | **Confirmed and investigated (2026-08-27) — real, dedup implemented** | 79% of rows duplicated, 98% of that the generic `AN AQI POST-OP COMPLICATIONS` reporting flag (null value, up to 49×/encounter) — same re-emission-per-note mechanism as `patient_visit`. A small remainder of real complication values duplicates the same way, grep-confirmed real. Silver collapses to 84,776 rows with an `n_occurrences` count. |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
 | `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
@@ -956,12 +956,28 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
 - [ ] *[enrichment, not urgent]* External vocabulary mapping (`MEDICATION_ID`→RxNorm/ATC,
       `ENC_TYPE_C`→Epic foundation categories) — flagged, not started.
 
-**`patient_post_op_complications`:**
-- [ ] *[dedup]* **Never checked.**
+**`patient_post_op_complications`:** — **dedup implemented in `scripts/build_silver.py::build_patient_post_op_complications`, 2026-08-27.**
+- [x] *[dedup]* 79% of bronze rows (161,000-ish of 203,945) duplicated. 98% of that is
+      the generic `AN AQI POST-OP COMPLICATIONS` reporting flag (`SMRTDTA_ELEM_VALUE`
+      always null, up to 49× per encounter) — same re-emission-per-note mechanism
+      confirmed for `patient_visit`, despite this table having `LOG_ID`
+      (`CONTEXT_NAME='NOTE'` is one of three contexts, consistent with "one row per
+      document/note referencing this element"). A small remainder (21 groups, 42 rows)
+      of real, non-null complications — `Unplanned Postoperative Ventillation`,
+      `Respiratory Failure`, `Hypotension (SBP<80 for 10 min)` — duplicate the same way;
+      grep-confirmed real at the source. Unlike `patient_medications` there's no
+      dose/quantity column at risk — a complication's presence doesn't need multiplying
+      into a total, so this carried no equivalent silent-data-loss risk. Collapsed to one
+      row per `(LOG_ID, MRN, Element_Name, CONTEXT_NAME, Element_abbr,
+      SMRTDTA_ELEM_VALUE)`, repeat count kept as `n_occurrences`. Verified in production
+      output: 84,776 rows (from 203,945 bronze), `sum(n_occurrences)` matches bronze
+      exactly, the real "Unplanned Postoperative Ventillation" duplicate shows
+      `n_occurrences=2`.
 - [ ] *[semantic]* When using as ML labels, filter out the generic
       `AN AQI POST-OP COMPLICATIONS` reporting flag (200,139 rows) — it's not a
       complication class, it dwarfs every real label and will corrupt a naive label
-      distribution.
+      distribution. Not yet applied to silver output (still present, now collapsed to
+      33,934+5,233+2,637 ≈ 41,804 distinct rows via `n_occurrences` rather than 200,139).
 - [ ] *[scope]* Prefer `CONTEXT_NAME='ENCOUNTER'` rows (97.8% of real specific-class
       labels) — `ORDER`/`NOTE` are mostly just the generic flag.
 

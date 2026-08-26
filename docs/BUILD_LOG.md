@@ -567,3 +567,40 @@ explaining after the fact via commit message.
 
 Next: `patient_post_op_complications` is the last table still gated on its own
 duplicate-row audit.
+
+## 2026-08-27 — Silver build: `patient_post_op_complications` done, bronze duplicate-row audit complete
+
+Ran the last outstanding duplicate-row audit. 79% of bronze rows (203,945 total)
+duplicated — but 98% of that is a single generic administrative flag,
+`AN AQI POST-OP COMPLICATIONS`, always null-valued, repeated up to 49× for one
+encounter. Same re-emission-per-note mechanism already confirmed for `patient_visit`:
+this table has `LOG_ID` yet still duplicates heavily within one encounter, and
+`CONTEXT_NAME` splits into `ENCOUNTER`/`ORDER`/`NOTE` — consistent with "one row per
+document/note that references this element," not a data defect.
+
+Before proposing a fix, explicitly checked for this table's version of the
+`patient_medications` mistake: is there a quantity/dose-like column that a blind
+collapse could silently drop? User asked directly ("so are we missing a note or free
+text field?") — checked and confirmed `SMRTDTA_ELEM_VALUE` is the only content-bearing
+column and it's already part of the dedup key; there's no separate note-text column
+`CONTEXT_NAME='NOTE'` might be pointing at. Also confirmed the small remainder of real
+complications (21 groups, 42 rows — `Unplanned Postoperative Ventillation`,
+`Respiratory Failure`, `Hypotension (SBP<80 for 10 min)`) that duplicate the same way
+are grep-real, not an ingestion artifact. Unlike medications, there's no dose/quantity
+column here at risk — a complication's presence doesn't need multiplying into a total,
+so this table carried none of the silent-data-loss risk the prior one did.
+
+Theory explained and approved before implementing, per the new process from the
+previous entry. `build_patient_post_op_complications` collapses to one row per
+`(LOG_ID, MRN, Element_Name, CONTEXT_NAME, Element_abbr, SMRTDTA_ELEM_VALUE)`, repeat
+count kept as `n_occurrences`. Verified: 84,776 rows (from 203,945 bronze),
+`sum(n_occurrences)` matches bronze exactly, the real "Unplanned Postoperative
+Ventillation" duplicate shows `n_occurrences=2`.
+
+**This closes out the duplicate-row audit across all 10 bronze tables** (see
+`DATA_DICTIONARY.md`'s "Duplicate-row audit" tracking table for the full summary) and
+the silver build now covers 7 of 10 tables (`patient_information`, `patient_lda`,
+`patient_history`, `patient_visit`, `patient_coding`, `patient_medications`,
+`patient_post_op_complications`). Remaining: `flowsheets` (mechanism confirmed, dedup
+recommended but not yet implemented — see "Duplicate-row audit" above) and
+`patient_labs` (0.38% exact duplicates, confirmed real, not yet implemented).

@@ -382,6 +382,45 @@ def build_patient_medications(catalog):
     write_silver_table(catalog, "patient_medications", df)
 
 
+# --- patient_post_op_complications --------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" ->
+# patient_post_op_complications): 79% of bronze rows duplicated, 98% of that is the
+# generic `AN AQI POST-OP COMPLICATIONS` reporting flag (SMRTDTA_ELEM_VALUE always null,
+# up to 49x per encounter) -- same re-emission-per-note mechanism confirmed for
+# patient_visit, despite this table having LOG_ID. A small remainder of real, non-null
+# complication values (21 groups, 42 rows) duplicate the same way, grep-verified real.
+# Collapsed to one row per group, repeat count kept as n_occurrences -- unlike
+# patient_medications there is no dose/quantity column at risk here.
+_PATIENT_POST_OP_COMPLICATIONS_COLS = [
+    "LOG_ID", "MRN", "Element_Name", "CONTEXT_NAME", "Element_abbr", "SMRTDTA_ELEM_VALUE",
+]
+_PATIENT_POST_OP_COMPLICATIONS_SQL = """
+SELECT {cols}, count(*) AS n_occurrences
+FROM read_parquet({{files}})
+GROUP BY {cols}
+""".format(cols=", ".join(_PATIENT_POST_OP_COMPLICATIONS_COLS))
+
+
+def build_patient_post_op_complications(catalog):
+    files = bronze_files(catalog, "patient_post_op_complications")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_POST_OP_COMPLICATIONS_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 84776  # distinct group count, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_post_op_complications: expected {n_expected:,} distinct groups, "
+            f"got {len(df):,} -- dedup logic no longer matches the validated shape, "
+            "stopping before write."
+        )
+    log.info(f"[patient_post_op_complications] {len(df):,} rows (from {n_bronze:,} "
+             f"bronze), max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_post_op_complications", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
@@ -389,6 +428,7 @@ BUILDERS = {
     "patient_visit": build_patient_visit,
     "patient_coding": build_patient_coding,
     "patient_medications": build_patient_medications,
+    "patient_post_op_complications": build_patient_post_op_complications,
 }
 
 
