@@ -160,10 +160,14 @@ SELECT
   PATIENT_CLASS_NM, PRIMARY_PROCEDURE_NM, IN_OR_DTTM, OUT_OR_DTTM, AN_START_DATETIME,
   AN_STOP_DATETIME
 FROM classified
-WHERE log_id_collision                       -- keep all rows for real collisions
-   OR (mrn_dup_row AND rn = 1)                -- collapse mrn-corruption duplicates to 1 row
-   OR (has_conflicting_duplicate AND rn = 1)  -- tie-break conflicts to 1 row
-   OR grp_n = 1                               -- normal single rows
+WHERE log_id_collision           -- keep all rows for real collisions
+   OR (mrn_dup_row AND rn = 1)   -- collapse mrn-corruption duplicates to 1 row
+   OR has_conflicting_duplicate  -- keep all rows for genuine conflicts, flagged (revised
+                                  -- 2026-08-27, supervisor review: the prior tie-break
+                                  -- silently discarded a real alternative value -- e.g.
+                                  -- age 64 vs 66, DISCH_DISP_C 15 vs 20 -- with no
+                                  -- recovery path. Matches log_id_collision's treatment.
+   OR grp_n = 1                  -- normal single rows
 """
 
 
@@ -173,12 +177,14 @@ def build_patient_information(catalog):
     df = con.execute(_PATIENT_INFORMATION_SQL.format(files=files)).fetchdf()
     df["_silver_built_at"] = datetime.now(timezone.utc)
 
-    n_expected = 64354  # matches the MOVER paper's stated EPIC surgery count exactly
+    n_expected_distinct = 64354  # matches the MOVER paper's stated EPIC surgery count
+    n_expected_rows = 64360  # 64357 + 3 extra rows from keeping both has_conflicting_duplicate rows
     n_distinct = df["LOG_ID"].nunique()
-    if n_distinct != n_expected:
+    if n_distinct != n_expected_distinct or len(df) != n_expected_rows:
         raise AssertionError(
-            f"patient_information: expected {n_expected} distinct LOG_ID, got {n_distinct} "
-            "-- dedup logic no longer matches the validated shape, stopping before write."
+            f"patient_information: expected {n_expected_distinct} distinct LOG_ID / "
+            f"{n_expected_rows} rows, got {n_distinct} / {len(df)} -- dedup logic no "
+            "longer matches the validated shape, stopping before write."
         )
     log.info(f"[patient_information] {len(df):,} rows, {n_distinct:,} distinct LOG_ID "
              f"(matches paper), mrn_corrupt={df['mrn_corrupt'].sum()}, "
@@ -195,7 +201,13 @@ def build_patient_information(catalog):
 # "Drain" + "Urinary Drainage" for one catheter). Collapse to one canonical row per real
 # device event (grouping on every column except Line_Group_Name, after trimming), and
 # carry every navigator category it was filed under in line_group_names instead of
-# duplicating the row. multi_navigator flags exactly the rows this rule collapsed.
+# duplicating the row. multi_navigator flags exactly the rows this collapsed for that
+# reason. Separately (found 2026-08-27, supervisor review): 271 rows (231 groups) are
+# plain exact duplicates -- identical Line_Group_Name too, not a cross-navigator split --
+# that array_agg(DISTINCT...) also silently absorbs with no record they existed. Added
+# n_occurrences (count(*) of the group) so every table in this batch preserves a repeat
+# count rather than discarding multiplicity information silently, even where (as here)
+# the collapsed rows carry no distinguishing information at risk.
 _PATIENT_LDA_SQL = """
 WITH normalized AS (
   SELECT LOG_ID, MRN, trim(description) AS description,
@@ -208,7 +220,8 @@ WITH normalized AS (
 SELECT LOG_ID, MRN, description, properties_display, site, placement_instant,
        removal_instant, flo_meas_name,
        list_sort(array_agg(DISTINCT Line_Group_Name)) AS line_group_names,
-       (count(DISTINCT Line_Group_Name) > 1) AS multi_navigator
+       (count(DISTINCT Line_Group_Name) > 1) AS multi_navigator,
+       count(*) AS n_occurrences
 FROM normalized
 GROUP BY LOG_ID, MRN, description, properties_display, site, placement_instant,
          removal_instant, flo_meas_name

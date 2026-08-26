@@ -780,6 +780,14 @@ check), rather than an artifact? Tested directly by pulling full real timelines:
   a discrete state change — it cannot be 5 genuine separate real-world events at one
   instant. This rules out the infusion-continuing theory as the general explanation (it
   remains plausible for `Rate Verify` in isolation, just not for the pattern as a whole).
+  **Fuller context found on independent review (2026-08-27):** the `14:31:24` moment
+  isn't specific to this one infusion — it's a mass-hold event, with `MAR Hold` charted
+  simultaneously across **44+ different medications** on the same encounter at that exact
+  timestamp (e.g. an anesthesia-related pause across the whole med list), of which only a
+  minority (31 of 274 hold/unhold events on that encounter) came out duplicated. That
+  strengthens rather than changes the conclusion — a real bedside action wouldn't
+  duplicate only part of a simultaneous mass event — but the sodium chloride example
+  above is one instance of that larger event, not an isolated single-infusion anomaly.
 - **What the pattern actually is: contiguous multi-day blocks, not scattered
   coincidence.** For both timelines, duplication doesn't scatter randomly across the
   encounter — it runs in long clean blocks (multiple days at 2-3× duplication), with
@@ -834,11 +842,16 @@ deliberately out of scope for this checklist — those get designed per model, n
       **`LOG_ID` is not a unique key for these 6 rows**; **1 is an `MRN`-corruption
       artifact** (`MRN` differs but everything else is identical, and both `MRN` values
       are the scientific-notation kind) — collapsed to 1 row, flagged `mrn_corrupt`;
-      **3 are genuine same-encounter conflicting values** (e.g. `DISCH_DISP_C` 15 vs 20)
-      — tie-broken to 1 row via a fixed, reproducible `ORDER BY` over every column,
-      flagged `has_conflicting_duplicate`. Verified in production output: 64,357 rows /
-      64,354 distinct `LOG_ID` (matches the paper exactly), `mrn_corrupt`=37,
-      `log_id_collision`=6, `has_conflicting_duplicate`=3.
+      **3 are genuine same-encounter conflicting values** (e.g. `DISCH_DISP_C` 15 vs 20,
+      age 64 vs 66) — **both rows kept, flagged `has_conflicting_duplicate` (revised
+      2026-08-27, supervisor review)**. The original version of this fix tie-broke these
+      to 1 row via a fixed `ORDER BY`, which silently discarded a real, differing
+      value with no recovery mechanism — the reviewer caught that this was the same
+      category of mistake as the `patient_medications` dose-loss issue, just far smaller
+      in scope (3 of 64,357 rows). Now treated the same as `log_id_collision`: `LOG_ID`
+      is not a unique key for these 6 rows either. Verified in production output: 64,360
+      rows / 64,354 distinct `LOG_ID` (matches the paper exactly), `mrn_corrupt`=37,
+      `log_id_collision`=6, `has_conflicting_duplicate`=6.
   - [ ] *[correction, open]* Of the 3 `log_id_collision` cases, only 2
         (`ebfbb4fcfd39fdff`/`c468eb4fb4f54ddb`) are genuine cross-patient collisions —
         confirmed via independent clinical data (real flowsheets for both `MRN`s). The
@@ -981,7 +994,7 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
 - [ ] *[scope]* Prefer `CONTEXT_NAME='ENCOUNTER'` rows (97.8% of real specific-class
       labels) — `ORDER`/`NOTE` are mostly just the generic flag.
 
-**`patient_lda`:** — **implemented in `scripts/build_silver.py::build_patient_lda`, 2026-08-24.**
+**`patient_lda`:** — **implemented in `scripts/build_silver.py::build_patient_lda`, 2026-08-24, revised 2026-08-27 (supervisor review).**
 - [x] *[dedup]* Collapsed the cross-navigator duplication: grouped on every column except
       `Line_Group_Name` (after trimming), one canonical row per real device event.
       Renamed `Line_Group_Name` → `line_group_names` (`list<string>`), holding every
@@ -991,6 +1004,18 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       exactly the 106,534/53,174 estimated during the column audit, since trimming
       whitespace here merges a handful of near-duplicate groups the earlier untrimmed scan
       counted separately), `multi_navigator`=53,218.
+  - [x] *[correction]* Independent review found this table was the only one in the whole
+        silver batch with no `n_occurrences`-style column — a separate set of plain exact
+        duplicates (same `Line_Group_Name` too, not a cross-navigator split) were being
+        silently absorbed by `array_agg(DISTINCT ...)` with no record they'd ever existed.
+        Added `n_occurrences` (`count(*)` of the group). Directly re-verified against live
+        silver output (own query, not the reviewer's unreproduced figure): **197 groups /
+        206 excess rows** are plain exact duplicates (`n_occurrences > 1` but
+        `multi_navigator = false`) — smaller than the reviewer's cited 231 groups / 271
+        rows, numbers not reconciled further since they don't change the fix. No
+        information was ever at risk (the collapsed rows are identical), this just closes
+        the one inconsistency with the rest of the batch's "always preserve the count"
+        discipline. `sum(n_occurrences)` = 465,801, matches bronze exactly.
 - [ ] *[open]* `[REMOVED]` description-prefix's real meaning still unclear. Column carried
       through to silver unchanged.
 - [ ] *[open]* `placement_instant` vs. `removal_instant` asymmetric null rate

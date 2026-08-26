@@ -604,3 +604,44 @@ the silver build now covers 7 of 10 tables (`patient_information`, `patient_lda`
 `patient_post_op_complications`). Remaining: `flowsheets` (mechanism confirmed, dedup
 recommended but not yet implemented — see "Duplicate-row audit" above) and
 `patient_labs` (0.38% exact duplicates, confirmed real, not yet implemented).
+
+## 2026-08-27 — Independent supervisor review of all 7 dedup fixes; 3 follow-ups applied
+
+Ran an independent review (a fresh agent, not the one that implemented the fixes) of
+every dedup decision made across the 7 tables — the point being to catch mistakes the
+implementer wouldn't catch on their own, the way the user caught the `patient_medications`
+dose-loss issue rather than it being self-identified. Methodology: re-read the docs and
+`build_silver.py`/`silver_schemas.py`, then independently re-queried bronze and silver
+live (not trusting the documented numbers) and grep-verified several claims against the
+raw source CSVs.
+
+**Result: 5 of 7 tables sound with no issues** (`patient_history`, `patient_visit`,
+`patient_coding`, `patient_medications`, `patient_post_op_complications`) — every
+top-line count, `sum(n_occurrences)` reconciliation, and specific cited example
+reproduced exactly. Two follow-ups were found and, after explaining the theory and
+getting explicit approval (per the process from the previous entry), fixed:
+
+1. **`patient_information`** — the 3 `has_conflicting_duplicate` rows were being
+   tie-broken to 1 row via a fixed `ORDER BY`, silently discarding a real, differing
+   value (age 64 vs 66; discharge disposition 15 vs 20) with no recovery mechanism. Same
+   category of mistake as the `patient_medications` issue, just 3 rows instead of
+   thousands. Fixed to match `log_id_collision`'s treatment: keep both rows, flag.
+   Production run: 64,360 rows (was 64,357), 64,354 distinct `LOG_ID` unchanged,
+   `has_conflicting_duplicate`=6 (was 3). Verified all 3 pairs now retain both values.
+2. **`patient_lda`** — the only table in the batch with no `n_occurrences`-equivalent
+   column; a separate small set of plain exact duplicates (not the documented
+   cross-navigator mechanism) were being silently absorbed by
+   `array_agg(DISTINCT Line_Group_Name)` with no record they existed. No information was
+   actually at risk (the collapsed rows are identical), but it broke the "always
+   preserve the count" discipline used everywhere else. Added `n_occurrences`. Own
+   re-verification against live silver output found 197 groups / 206 excess rows are
+   plain duplicates — different from the reviewer's cited 231/271, not reconciled
+   further since it doesn't change the fix; `sum(n_occurrences)`=465,801 matches bronze.
+3. **Doc-only**: the "MAR duplicate-row investigation" writeup framed the `patient_medications`
+   5×/5× `MAR Hold`/`MAR Unhold` example as an isolated single-infusion case; the
+   reviewer found it's actually one instance of a 44+-medication simultaneous mass-hold
+   event on that encounter. Updated the writeup — strengthens the existing conclusion,
+   no code change.
+
+Both `silver.patient_information` and `silver.patient_lda` were dropped and rebuilt
+(schema changes needed fresh tables, same as `patient_medications`'s revision earlier).

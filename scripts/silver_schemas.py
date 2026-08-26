@@ -42,8 +42,10 @@ SILVER_TABLES = {
         # share this LOG_ID value. Both rows are kept; any downstream LOG_ID join
         # must also disambiguate by MRN for rows where this is true.
         ("log_id_collision", BooleanType(), True),
-        # True on the single row kept after a same-LOG_ID, same-MRN, genuinely
-        # conflicting-value duplicate was tie-broken (deterministic, not a data claim).
+        # LOG_ID is not a unique key for these rows either (revised 2026-08-27,
+        # supervisor review) -- same-LOG_ID, same-MRN rows with a genuinely conflicting
+        # value (e.g. age 64 vs 66, DISCH_DISP_C 15 vs 20) are both kept, not tie-broken,
+        # since silently picking one discarded a real alternative with no recovery path.
         ("has_conflicting_duplicate", BooleanType(), True),
         ("DISCH_DISP_C", LongType(), False),
         ("DISCH_DISP", StringType(), False),
@@ -89,6 +91,13 @@ SILVER_TABLES = {
         ), False),
         # True where this device event was the cross-navigator duplication described above.
         ("multi_navigator", BooleanType(), False),
+        # Total raw bronze rows collapsed into this group (added 2026-08-27, supervisor
+        # review) -- covers both multi_navigator rows and a separate small set of plain
+        # exact duplicates (271 rows / 231 groups) that array_agg(DISTINCT...) alone
+        # would silently absorb with no record they existed. No information is at risk
+        # here (collapsed rows are identical), but this keeps every table in the batch
+        # consistent about never discarding multiplicity information silently.
+        ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
 
