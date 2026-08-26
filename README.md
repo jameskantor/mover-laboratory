@@ -8,9 +8,15 @@ Source paper: Samad et al., *"Medical Informatics Operating Room Vitals and Even
 Repository (MOVER): a public-access operating room database"*, JAMIA Open 2023,
 https://doi.org/10.1093/jamiaopen/ooad084
 
-**This data is de-identified and credentialed-access (not HIPAA-regulated); this repo is
-private.** Raw source data (CSVs, the Iceberg warehouse) still isn't committed, since the
-MOVER agreement doesn't allow redistributing it — `.gitignore` excludes those and logs.
+> **⚠️ Active development — not a finished product.** Bronze layer is complete and
+> verified; the silver layer is being built incrementally, table by table (see "Status"
+> below and `docs/DATA_DICTIONARY.md`'s checklist for what's done vs. outstanding).
+> Findings, schemas, and scripts here can and will change without notice. If you're
+> building on this, pin a commit rather than tracking `main`.
+
+**This data is de-identified and credentialed-access (not HIPAA-regulated).** Raw source
+data (CSVs, the Iceberg warehouse) still isn't committed, since the MOVER agreement
+doesn't allow redistributing it — `.gitignore` excludes those and logs.
 
 **This README's job is to let someone else stand up their own copy of this lab** — their
 own machine, their own credentialed MOVER download, the same containers and scripts. It
