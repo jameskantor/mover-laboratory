@@ -305,11 +305,46 @@ def build_patient_visit(catalog):
     write_silver_table(catalog, "patient_visit", df)
 
 
+# --- patient_coding -----------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_coding):
+# Same mechanism as patient_history: no encounter id in this table, so a billing code
+# gets re-exported once per clinical encounter that patient had -- grep-verified real
+# against the raw source CSV (top group: 612 literal matching lines for one 34-surgery
+# patient's ICD-10-PCS 0HDAXZZ). Collapsed to one row per (MRN, SOURCE_KEY, SOURCE_NAME,
+# NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE), repeat count kept as n_occurrences.
+_PATIENT_CODING_SQL = """
+SELECT MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE,
+       count(*) AS n_occurrences
+FROM read_parquet({files})
+GROUP BY MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE
+"""
+
+
+def build_patient_coding(catalog):
+    files = bronze_files(catalog, "patient_coding")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_CODING_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 1244633  # distinct group count, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_coding: expected {n_expected:,} distinct groups, got {len(df):,} "
+            "-- dedup logic no longer matches the validated shape, stopping before write."
+        )
+    log.info(f"[patient_coding] {len(df):,} rows (from {n_bronze:,} bronze), "
+             f"max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_coding", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
     "patient_history": build_patient_history,
     "patient_visit": build_patient_visit,
+    "patient_coding": build_patient_coding,
 }
 
 

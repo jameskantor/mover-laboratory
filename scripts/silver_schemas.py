@@ -120,4 +120,22 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_coding": _schema([
+        ("MRN", StringType(), True),
+        ("SOURCE_KEY", LongType(), False),
+        ("SOURCE_NAME", StringType(), False),
+        ("NAME", StringType(), False),
+        ("REF_BILL_CODE_SET_NAME", StringType(), False),
+        ("REF_BILL_CODE", StringType(), False),
+        # Same mechanism as patient_history: no encounter id in this table, so a billing
+        # code gets re-exported once per clinical encounter that patient had (grep-
+        # verified real against the raw source CSV: the top group, 612 occurrences of
+        # ICD-10-PCS 0HDAXZZ for one 34-surgery patient, matches exactly). Collapsed to
+        # one row per (MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME,
+        # REF_BILL_CODE), repeat count kept explicitly rather than left implicit.
+        # Collapses 2,033,948 bronze rows to 1,244,633 distinct groups.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

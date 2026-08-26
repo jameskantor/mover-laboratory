@@ -589,7 +589,7 @@ already flagged.
 | `patient_information` | **Gap confirmed, externally corroborated, row content not yet inspected** | 65,728 total rows but only 64,354 distinct `LOG_ID` (1,374 excess rows). Found incidentally during the `patient_procedure_events` sequencing analysis (2026-08-21). **2026-08-23: externally confirmed 64,354 is the correct count** — the official MOVER paper's own stated surgery count for the EPIC dataset is 64,354, matching the distinct-`LOG_ID` count exactly, not the raw row count. Still not checked whether the 1,374 excess rows are exact duplicates or genuinely divergent content sharing a `LOG_ID` — see "Silver-layer design checklist" below. |
 | `patient_history` | **Confirmed and investigated (2026-08-25) — real, mechanistic, dedup implemented** | 76% of rows (734,073/970,741) duplicated on `(mrn, diagnosis_code, dx_name)`. No encounter id in this table, so a chronic diagnosis re-exports once per clinical encounter — ratio scales ~1:1 with each patient's surgery count (1.09× to 52×), grep-confirmed real at the source. Silver collapses to 437,721 rows with an `n_occurrences` count — see "Silver-layer design checklist" below. |
 | `patient_visit` | **Confirmed and investigated (2026-08-25) — real, dedup implemented** | 57% of rows (125,405/219,257) duplicated on `(LOG_ID, mrn, diagnosis_code, dx_name)`, but *within* one encounter, not across encounters like `patient_history` — likely one row per clinical note reiterating the diagnosis list. Grep-confirmed real at the source. Silver collapses to 131,455 rows with an `n_occurrences` count. |
-| `patient_coding` | Not checked | Found 1 corrupted row during column audit (see above) — different issue, not a duplicate |
+| `patient_coding` | **Confirmed and investigated (2026-08-26) — real, dedup implemented** | 55% of rows (1,124,044/2,033,948) duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE)` — same no-encounter-id re-export-per-encounter mechanism as `patient_history`. Grep-confirmed real at the source (612× top group). Silver collapses to 1,244,633 rows with an `n_occurrences` count. Separately, 1 corrupted row found during the column audit (see above) — different issue, not part of this duplication. |
 | `patient_medications` | Not checked | Column audit found an `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue — different issue, not confirmed as row duplication |
 | `patient_post_op_complications` | Not checked | |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
@@ -861,10 +861,20 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       source population). Document the join caveat explicitly rather than force-joining
       or silently dropping orphans.
 
-**`patient_coding`:**
-- [ ] *[dedup]* **Never checked.**
+**`patient_coding`:** — **dedup implemented in `scripts/build_silver.py::build_patient_coding`, 2026-08-26.**
+- [x] *[dedup]* Same mechanism as `patient_history`: 55% of bronze rows (1,124,044 of
+      2,033,948) duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME,
+      REF_BILL_CODE_SET_NAME, REF_BILL_CODE)`. No encounter id in this table either, so a
+      billing code re-exports once per clinical encounter that patient had — the top
+      group (612 occurrences of ICD-10-PCS `0HDAXZZ` for one 34-surgery patient)
+      grep-confirmed as 612 literal matching lines in the raw source CSV before
+      trusting it. Note `SOURCE_KEY` is a 7-value code-set-type lookup id, not a row
+      id — don't mistake it for a unique key. Collapsed to one row per group, repeat
+      count kept as `n_occurrences`. Verified in production output: 1,244,633 rows
+      (from 2,033,948 bronze), `sum(n_occurrences)` matches the bronze row count
+      exactly, known 612× group collapses correctly.
 - [ ] *[accuracy]* Drop the 1 fully-corrupted row (`SOURCE_NAME='Final Di'`, truncated
-      mid-word, every other column null).
+      mid-word, every other column null). Not yet applied to silver output.
 - [ ] *[semantic]* Don't trust `SOURCE_NAME`'s code-system claim — "CPT"-labeled rows are
       actually a mix of true CPT, Category III CPT, and HCPCS Level II. If a clean code
       system is needed downstream, derive it from the actual code format, not the label.

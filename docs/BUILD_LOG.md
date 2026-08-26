@@ -483,3 +483,24 @@ collapses correctly on verification.
 
 Next: `patient_coding`, `patient_medications`, and `patient_post_op_complications` still
 need their own duplicate-row audits.
+
+## 2026-08-26 — Silver build: `patient_coding` done
+
+Ran the `patient_coding` duplicate-row audit — 55% of bronze rows (1,124,044/2,033,948)
+duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME,
+REF_BILL_CODE)`. Same mechanism as `patient_history`: this table has no encounter id
+either, so a billing code re-exports once per clinical encounter that patient had —
+duplication correlates with each patient's surgery count the same way (the top group,
+612 occurrences of ICD-10-PCS `0HDAXZZ`, belongs to a 34-surgery patient). Grep-verified
+against the raw source CSV (612 literal matching lines) before trusting it, same
+discipline as the prior two tables. One incidental finding along the way: `SOURCE_KEY`
+looked like it might be a row id (it's typed `long`), but it's actually a 7-value
+code-set-type lookup key — worth knowing before anyone assumes it's unique per row.
+
+Applied the same fix: `build_patient_coding` in `scripts/build_silver.py` collapses to
+one row per group, repeat count kept as `n_occurrences`. Production run: 1,244,633 rows
+(from 2,033,948 bronze), `sum(n_occurrences)` matches bronze exactly, known 612× group
+collapses correctly on verification.
+
+Next: `patient_medications` and `patient_post_op_complications` still need their own
+duplicate-row audits before more of silver can be built.
