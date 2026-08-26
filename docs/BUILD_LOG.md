@@ -525,5 +525,45 @@ rather than adding an `n_occurrences` column — the first table in this series 
 simpler treatment instead. Production run: 27,773,144 rows (from 27,961,524 bronze), the
 known 15× group collapses to exactly 1 row on verification.
 
+## 2026-08-27 — `patient_medications` dedup revised: was silently dropping dosed rows
+
+The `SELECT DISTINCT` fix from the day before was wrong, caught by the user before it
+went further: `ADMIN_SIG` (dose) is populated on 95.7% of `Given` rows, 60% of `Rate
+Verify`, 69% of `New Bag`, 93% of `Rate Change` — not logistics-only actions as assumed.
+11,509 duplicate `Given` groups with a real dose lost 11,783 rows to the blind collapse.
+The user also raised a competing theory worth testing on its own merits: could the
+duplicates represent a fluid infusion genuinely continuing at that minute, rather than
+an artifact to discard?
+
+Tested both questions directly against real charting timelines (not assumed either way).
+Pulled two full real MAR histories end to end. Both show duplication clustering in
+**clean multi-day blocks** (every action doubled/tripled for days, then a sharp
+transition to clean singletons) rather than scattered across the timeline — and in one
+case, `MAR Hold`/`MAR Unhold` (one-time, discrete actions) each repeat 5× at the
+**identical second** (`14:31:24`, `17:02:48`). A state-change action can't be 5 genuine
+separate real events at one instant, which rules out the infusion-continuing theory as
+the general explanation. The block shape instead points at an export/ETL artifact —
+likely an overlapping date-range extraction window in MOVER's own per-encounter export,
+the same family of issue as the confirmed `flowsheets` re-emission mechanism. One case's
+block also recurred identically across 5 different `LOG_ID`s all sharing one `MRN` — one
+patient's continuous ICU stay spanning 5 procedures 13 days apart, the medication
+order's MAR history apparently attributed to (and independently duplicated within)
+multiple of that admission's encounters. Full writeup: `DATA_DICTIONARY.md` → "MAR
+duplicate-row investigation."
+
+**Revised fix:** switched from `SELECT DISTINCT` to the collapse-to-`n_occurrences`
+pattern already used for `patient_history`/`patient_visit`/`patient_coding`, so the
+duplicate record is preserved as a count rather than deleted. Added an explicit warning
+in the schema comment and docs: `n_occurrences` reflects export duplication, not repeat
+administration — never multiply `ADMIN_SIG` by it to compute a dose or fluid total.
+Dropped and rebuilt `silver.patient_medications` (schema changed, needed a fresh table).
+Verified: 27,773,144 rows, `sum(n_occurrences)` matches bronze exactly, known 15× group
+shows `n_occurrences=15`.
+
+Process change adopted going forward, saved to memory
+(`feedback_dedup_approval.md`): explain the duplicate-row theory and get explicit
+approval before implementing any table's dedup fix, rather than building first and
+explaining after the fact via commit message.
+
 Next: `patient_post_op_complications` is the last table still gated on its own
 duplicate-row audit.

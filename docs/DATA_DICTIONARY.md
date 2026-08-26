@@ -590,7 +590,7 @@ already flagged.
 | `patient_history` | **Confirmed and investigated (2026-08-25) — real, mechanistic, dedup implemented** | 76% of rows (734,073/970,741) duplicated on `(mrn, diagnosis_code, dx_name)`. No encounter id in this table, so a chronic diagnosis re-exports once per clinical encounter — ratio scales ~1:1 with each patient's surgery count (1.09× to 52×), grep-confirmed real at the source. Silver collapses to 437,721 rows with an `n_occurrences` count — see "Silver-layer design checklist" below. |
 | `patient_visit` | **Confirmed and investigated (2026-08-25) — real, dedup implemented** | 57% of rows (125,405/219,257) duplicated on `(LOG_ID, mrn, diagnosis_code, dx_name)`, but *within* one encounter, not across encounters like `patient_history` — likely one row per clinical note reiterating the diagnosis list. Grep-confirmed real at the source. Silver collapses to 131,455 rows with an `n_occurrences` count. |
 | `patient_coding` | **Confirmed and investigated (2026-08-26) — real, dedup implemented** | 55% of rows (1,124,044/2,033,948) duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE)` — same no-encounter-id re-export-per-encounter mechanism as `patient_history`. Grep-confirmed real at the source (612× top group). Silver collapses to 1,244,633 rows with an `n_occurrences` count. Separately, 1 corrupted row found during the column audit (see above) — different issue, not part of this duplication. |
-| `patient_medications` | **Confirmed and investigated (2026-08-26) — real, small-scale, dedup implemented** | Only 1.24% of rows (345,530/27,961,524) duplicated — a different, smaller-scale mechanism than the no-`LOG_ID` tables: this table has an encounter id, so it's a MAR action charted more than once per encounter (max group size 15), not a per-encounter re-export. Grep-confirmed real at the source. Silver collapses via plain `SELECT DISTINCT` to 27,773,144 rows. Separately still open: the `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue. |
+| `patient_medications` | **Confirmed and investigated (2026-08-27) — export artifact, dedup implemented** | Only 1.24% of rows (345,530/27,961,524) duplicated. Full investigation (see "MAR duplicate-row investigation" above) confirmed this is an export/ETL artifact — contiguous multi-day duplicate blocks, one-time actions repeating at the identical second, the pattern recurring identically across one patient's multiple encounters — not charting noise and not periodic infusion-continuation checks. Silver collapses to `n_occurrences` (27,773,144 rows), matching `patient_history`/`patient_visit`/`patient_coding`'s treatment; never multiply `ADMIN_SIG` by `n_occurrences` for a dose/fluid total. Separately still open: the `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue. |
 | `patient_post_op_complications` | Not checked | |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
@@ -752,6 +752,59 @@ way). `log_id_collision` count would drop from 6 to 4. Not applied yet — this 
 of the finding and the recommended fix, not a code change; `build_silver.py` still
 treats all 3 as collisions and keeps all 6 rows as of this writing.
 
+## MAR duplicate-row investigation (patient_medications)
+
+**Confirmed 2026-08-27.** `patient_medications` has 345,530 duplicated rows (1.24% of
+27,961,524) — small next to `patient_history`/`patient_coding`'s 55-76%, since this
+table already has an encounter id (`LOG_ID`). Initial framing (2026-08-26) called this
+"MAR charting noise" and collapsed it via `SELECT DISTINCT`. That was wrong on two
+counts, both caught before merging:
+
+1. **It silently deleted dose-bearing rows.** `ADMIN_SIG` (dose) is populated on 95.7%
+   of `Given` rows, 60% of `Rate Verify`, 69% of `New Bag`, 93% of `Rate Change` — these
+   aren't logistics-only actions. 11,509 duplicate groups where `MAR_ACTION_NM='Given'`
+   and `ADMIN_SIG` was non-null lost 11,783 rows to the `SELECT DISTINCT` collapse.
+2. **The theory itself was untested.** "Charting noise" was never verified against real
+   timelines before being used to justify deletion.
+
+**A competing theory was raised and tested: could duplicates represent a fluid infusion
+correctly continuing at that minute** (e.g. a periodic "still running, still at rate X"
+check), rather than an artifact? Tested directly by pulling full real timelines:
+
+- **Ruled out by same-second repeats of one-time actions.** One heparin infusion
+  (`LOG_ID ee04fd363d4c4fbf`) shows a clean ~12-hour window (2020-07-13 07:15–19:00)
+  where *every* action is doubled — including `Rate Change Dual Sign` and `New Bag`,
+  which are one-time events, not recurring checks. A second case (`LOG_ID
+  8172c57dc6cc59fd`, sodium chloride infusion) shows `MAR Hold` and `MAR Unhold` each
+  repeated 5× at the **exact same second** (`14:31:24` and `17:02:48`). A Hold/Unhold is
+  a discrete state change — it cannot be 5 genuine separate real-world events at one
+  instant. This rules out the infusion-continuing theory as the general explanation (it
+  remains plausible for `Rate Verify` in isolation, just not for the pattern as a whole).
+- **What the pattern actually is: contiguous multi-day blocks, not scattered
+  coincidence.** For both timelines, duplication doesn't scatter randomly across the
+  encounter — it runs in long clean blocks (multiple days at 2-3× duplication), with
+  sharp transitions to blocks of clean singleton rows. That shape is inconsistent with
+  bedside charting behavior and consistent with an **export/ETL artifact**: an
+  overlapping date-range extraction window in MOVER's own per-encounter export, similar
+  in spirit to the confirmed `flowsheets` re-emission mechanism (see "Duplicate-row
+  audit" above).
+- **Corroborating context for the second case:** the block (2022-11-10 to -24) recurs
+  **identically across 5 different `LOG_ID`s, all the same `MRN`** — one patient's single
+  continuous ICU admission spanning 5 procedures 13 days apart (CABG → tracheostomy →
+  laparoscopy → ECMO line removal → laparotomy). The sodium chloride infusion ran
+  continuously through the whole stay; its MAR history got attributed to (and
+  independently duplicated within) multiple of that admission's `LOG_ID`s — the same
+  "no clean encounter-scoping for multi-surgery admissions" mechanism already found in
+  `patient_history`/`patient_visit`/`patient_coding`, compounded by the block-duplication
+  artifact on top.
+
+**Conclusion:** this is a confirmed export artifact, not real repeat clinical events —
+safe to collapse. **Fix (revised 2026-08-27):** collapse to `n_occurrences`, same
+pattern as `patient_history`/`patient_visit`/`patient_coding`, instead of the
+row-deleting `SELECT DISTINCT` used the day before. `n_occurrences` must never be
+multiplied against `ADMIN_SIG` to compute a dose/fluid total — that conflates export
+duplication with real repeat administration; totals are a deliberate gold-layer decision.
+
 ## Silver-layer design checklist
 
 Organized by table, each item tagged with which data-quality dimension it belongs to
@@ -879,18 +932,22 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       actually a mix of true CPT, Category III CPT, and HCPCS Level II. If a clean code
       system is needed downstream, derive it from the actual code format, not the label.
 
-**`patient_medications`:** — **dedup implemented in `scripts/build_silver.py::build_patient_medications`, 2026-08-26.**
-- [x] *[dedup]* Different mechanism than `patient_history`/`patient_coding`: this table
-      HAS an encounter id (`LOG_ID`), and only 1.24% of bronze rows (345,530 of
-      27,961,524) were duplicated — much smaller scale, max group size 15 (not
-      hundreds). A MAR (medication administration) action charted more than once for
-      the same encounter, not a per-encounter re-export pattern. Grep-confirmed the top
-      group (15× — a `MAR Hold` for `sodium chloride 0.9% infusion` on one encounter)
-      real against the raw source CSV. Collapsed via plain `SELECT DISTINCT` — the
-      repeat count here is charting noise, not a chronicity signal like
-      `patient_history`'s, so no `n_occurrences` column was added. Verified in
-      production output: 27,773,144 rows (from 27,961,524 bronze), the known 15× group
-      collapses to exactly 1 row.
+**`patient_medications`:** — **dedup implemented in `scripts/build_silver.py::build_patient_medications`, 2026-08-26, revised 2026-08-27 after investigation (see "MAR duplicate-row investigation" below).**
+- [x] *[dedup]* 1.24% of bronze rows (345,530 of 27,961,524) were duplicated — a much
+      smaller scale than `patient_history`/`patient_coding` (55-76%), since this table
+      already has an encounter id. **Confirmed via full investigation to be an export
+      artifact, not real clinical events** — see the dedicated writeup below for the
+      evidence (block-clustered duplication, same-second repeats of one-time actions,
+      the pattern recurring identically across one patient's multiple encounters).
+      Collapsed to one row per exact-duplicate group, repeat count kept as
+      `n_occurrences` (same pattern as `patient_history`/`patient_visit`/
+      `patient_coding`) rather than deleted — an earlier version of this fix used plain
+      `SELECT DISTINCT`, which silently discarded 11,783 dose-bearing `Given` rows;
+      caught before merging, see the writeup. **`n_occurrences` must never be multiplied
+      against `ADMIN_SIG` (dose) to compute a total** — it reflects export duplication,
+      not repeat administration. Verified in production output: 27,773,144 rows (from
+      27,961,524 bronze), `sum(n_occurrences)` matches bronze exactly, the known 15×
+      group shows `n_occurrences=15`.
 - [ ] *[standardization]* Trim the `ORDER_STATUS_NM` `"0 "`-prefix variant (9,377 rows).
       Not yet applied to silver output.
 - [ ] *[semantic, open]* Classify every `MAR_ACTION_NM` value (Given/Hold/Rate

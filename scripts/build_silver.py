@@ -340,14 +340,17 @@ def build_patient_coding(catalog):
 
 
 # --- patient_medications ------------------------------------------------------------------
-# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_medications):
-# Different mechanism than patient_history/patient_coding: this table HAS an encounter id
-# (LOG_ID), and only 1.24% of bronze rows are duplicated (vs. 55-76% in the no-encounter-id
-# tables), with max group size 15 (not hundreds) -- a MAR action charted more than once for
-# the same encounter, not a per-encounter re-export pattern. Grep-verified the top group
-# (15x) real against the raw source CSV. Collapsed via plain SELECT DISTINCT -- unlike
-# patient_history's chronicity signal, this repeat count is charting noise, not carried
-# forward as n_occurrences.
+# Dedup rule (see DATA_DICTIONARY.md "MAR duplicate-row investigation" for the full
+# writeup): CONFIRMED export artifact, not real clinical events. Duplicate groups cluster
+# in contiguous multi-day blocks, and one-time actions (MAR Hold/Unhold) repeat at the
+# identical second within those blocks -- rules out both charting noise and periodic
+# infusion-continuation checks as the general explanation. The block pattern recurs
+# identically across every LOG_ID belonging to one patient's single continuous
+# multi-surgery admission, consistent with an overlapping date-range extraction window in
+# MOVER's own per-encounter export. Collapsed to one row per group, repeat count kept as
+# n_occurrences (same pattern as patient_history/patient_visit/patient_coding) --
+# n_occurrences reflects export duplication, NEVER multiply ADMIN_SIG (dose) by it to
+# compute a total; that's a deliberate gold-layer decision, not a silver default.
 _PATIENT_MEDICATIONS_COLS = [
     "ENC_TYPE_C", "ENC_TYPE_NM", "LOG_ID", "MRN", "ORDERING_DATE", "ORDER_CLASS_NM",
     "MEDICATION_ID", "DISPLAY_NAME", "MEDICATION_NM", "START_DATE", "END_DATE",
@@ -355,8 +358,9 @@ _PATIENT_MEDICATIONS_COLS = [
     "DOSE_UNIT_NM", "MED_ROUTE_NM",
 ]
 _PATIENT_MEDICATIONS_SQL = """
-SELECT DISTINCT {cols}
+SELECT {cols}, count(*) AS n_occurrences
 FROM read_parquet({{files}})
+GROUP BY {cols}
 """.format(cols=", ".join(_PATIENT_MEDICATIONS_COLS))
 
 

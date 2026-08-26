@@ -158,15 +158,23 @@ SILVER_TABLES = {
         ("ADMIN_SIG", DoubleType(), False),
         ("DOSE_UNIT_NM", StringType(), False),
         ("MED_ROUTE_NM", StringType(), False),
-        # Different mechanism than patient_history/patient_coding: this table HAS an
-        # encounter id (LOG_ID), and only 1.24% of bronze rows are duplicated (vs. 55-76%
-        # in the no-encounter-id tables), with a much smaller max group size (15, not
-        # hundreds) -- a MAR (medication administration) action getting charted more than
-        # once for the same encounter, not a per-encounter re-export pattern. Grep-verified
-        # the top group (15x) real against the raw source CSV. Collapsed via plain
-        # SELECT DISTINCT (no n_occurrences -- unlike patient_history's chronicity signal,
-        # this repeat count doesn't carry real information, it's charting noise).
-        # Collapses 27,961,524 bronze rows to 27,773,144 distinct rows.
+        # CONFIRMED EXPORT ARTIFACT, not real clinical events (investigated 2026-08-27,
+        # see docs/DATA_DICTIONARY.md "MAR duplicate-row investigation" for the full
+        # writeup). Duplicate groups cluster in contiguous multi-day blocks, and discrete
+        # one-time actions (MAR Hold/Unhold) repeat at the identical second within those
+        # blocks -- e.g. one MAR Hold at the exact same timestamp charted 5 times. This
+        # rules out both charting noise (a nurse re-clicking) and periodic infusion-
+        # continuation checks as the general explanation. The block pattern also recurs
+        # identically across every LOG_ID belonging to one patient's single continuous
+        # multi-surgery admission, consistent with an overlapping date-range extraction
+        # window in MOVER's own per-encounter export. Collapsed to one row per exact
+        # duplicate group, repeat count kept as n_occurrences (same pattern as
+        # patient_history/patient_visit/patient_coding) rather than deleted outright.
+        # *** n_occurrences reflects export duplication, not repeat administration --
+        # NEVER multiply ADMIN_SIG (dose) by n_occurrences to compute a patient's med or
+        # fluid total. That is a deliberate gold-layer decision, not a silver default. ***
+        # Collapses 27,961,524 bronze rows to 27,773,144 distinct groups.
+        ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
 }
