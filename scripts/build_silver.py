@@ -258,10 +258,17 @@ def build_patient_lda(catalog):
 # 1-surgery patient up to 52x for the one 41-surgery patient). Collapsed to one row per
 # (mrn, diagnosis_code, dx_name), keeping the repeat count explicitly as n_occurrences
 # rather than leaving it as an implicit, easy-to-lose row count.
+# Casing/trim pass (2026-08-27, global standardization): bronze's `mrn` renamed to `MRN`
+# to match every other table (silent-join-failure risk otherwise); `diagnosis_code` and
+# `dx_name` trimmed. Checked impact before applying: 0 merges for this table's columns
+# -- purely cosmetic, no row-count change.
 _PATIENT_HISTORY_SQL = """
-SELECT mrn, diagnosis_code, dx_name, count(*) AS n_occurrences
-FROM read_parquet({files})
-GROUP BY mrn, diagnosis_code, dx_name
+SELECT MRN, diagnosis_code, dx_name, count(*) AS n_occurrences
+FROM (
+  SELECT mrn AS MRN, trim(diagnosis_code) AS diagnosis_code, trim(dx_name) AS dx_name
+  FROM read_parquet({files})
+)
+GROUP BY MRN, diagnosis_code, dx_name
 """
 
 
@@ -292,10 +299,15 @@ def build_patient_history(catalog):
 # row per clinical note/document that reiterates the visit's diagnosis list -- not
 # resolvable further without a note id, which bronze doesn't have. Same treatment as
 # patient_history: collapsed to one row per group, repeat count kept as n_occurrences.
+# Casing/trim pass (2026-08-27): `mrn` renamed to `MRN`; `diagnosis_code`/`dx_name`
+# trimmed. Checked impact before applying: 0 merges -- purely cosmetic here.
 _PATIENT_VISIT_SQL = """
-SELECT LOG_ID, mrn, diagnosis_code, dx_name, count(*) AS n_occurrences
-FROM read_parquet({files})
-GROUP BY LOG_ID, mrn, diagnosis_code, dx_name
+SELECT LOG_ID, MRN, diagnosis_code, dx_name, count(*) AS n_occurrences
+FROM (
+  SELECT LOG_ID, mrn AS MRN, trim(diagnosis_code) AS diagnosis_code, trim(dx_name) AS dx_name
+  FROM read_parquet({files})
+)
+GROUP BY LOG_ID, MRN, diagnosis_code, dx_name
 """
 
 
@@ -325,10 +337,21 @@ def build_patient_visit(catalog):
 # against the raw source CSV (top group: 612 literal matching lines for one 34-surgery
 # patient's ICD-10-PCS 0HDAXZZ). Collapsed to one row per (MRN, SOURCE_KEY, SOURCE_NAME,
 # NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE), repeat count kept as n_occurrences.
+# Trim pass (2026-08-27, global standardization): trimmed all 4 categorical string
+# columns. Impact was checked incorrectly at first (comparing each column's DISTINCT
+# count before/after trim in isolation suggested NAME would merge 1 group -- but that
+# only proves two rows somewhere share a whitespace-variant NAME, not that they're
+# otherwise-identical rows in this table's 6-column dedup key). Correctly re-checked
+# against the full group-by tuple: 0 real merges. Row count is unchanged, 1,244,633.
 _PATIENT_CODING_SQL = """
 SELECT MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE,
        count(*) AS n_occurrences
-FROM read_parquet({files})
+FROM (
+  SELECT MRN, SOURCE_KEY, trim(SOURCE_NAME) AS SOURCE_NAME, trim(NAME) AS NAME,
+         trim(REF_BILL_CODE_SET_NAME) AS REF_BILL_CODE_SET_NAME,
+         trim(REF_BILL_CODE) AS REF_BILL_CODE
+  FROM read_parquet({files})
+)
 GROUP BY MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE
 """
 
@@ -340,7 +363,7 @@ def build_patient_coding(catalog):
     df["_silver_built_at"] = datetime.now(timezone.utc)
 
     n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
-    n_expected = 1244633  # distinct group count, verified by hand
+    n_expected = 1244633  # unchanged by trim pass -- verified 0 real merges (see above)
     if len(df) != n_expected:
         raise AssertionError(
             f"patient_coding: expected {n_expected:,} distinct groups, got {len(df):,} "
@@ -364,17 +387,35 @@ def build_patient_coding(catalog):
 # n_occurrences (same pattern as patient_history/patient_visit/patient_coding) --
 # n_occurrences reflects export duplication, NEVER multiply ADMIN_SIG (dose) by it to
 # compute a total; that's a deliberate gold-layer decision, not a silver default.
+# Trim pass (2026-08-27, global standardization): trimmed all 9 categorical string
+# columns (ID/key columns LOG_ID/MRN and numeric/timestamp columns left untouched).
+# Impact was checked incorrectly at first (per-column DISTINCT-count reduction suggested
+# 15 merges on DISPLAY_NAME -- but that only shows two rows SOMEWHERE share a
+# whitespace-variant name, not that they're otherwise-identical within this table's full
+# 17-column dedup key). Correctly re-checked against the full group-by tuple: 0 real
+# merges. Row count is unchanged, 27,773,144.
 _PATIENT_MEDICATIONS_COLS = [
     "ENC_TYPE_C", "ENC_TYPE_NM", "LOG_ID", "MRN", "ORDERING_DATE", "ORDER_CLASS_NM",
     "MEDICATION_ID", "DISPLAY_NAME", "MEDICATION_NM", "START_DATE", "END_DATE",
     "ORDER_STATUS_NM", "RECORD_TYPE", "MAR_ACTION_NM", "MED_ACTION_TIME", "ADMIN_SIG",
     "DOSE_UNIT_NM", "MED_ROUTE_NM",
 ]
+_PATIENT_MEDICATIONS_TRIM_COLS = {
+    "ENC_TYPE_NM", "ORDER_CLASS_NM", "DISPLAY_NAME", "MEDICATION_NM", "ORDER_STATUS_NM",
+    "RECORD_TYPE", "MAR_ACTION_NM", "DOSE_UNIT_NM", "MED_ROUTE_NM",
+}
+_PATIENT_MEDICATIONS_SELECT_COLS = ", ".join(
+    f"trim({c}) AS {c}" if c in _PATIENT_MEDICATIONS_TRIM_COLS else c
+    for c in _PATIENT_MEDICATIONS_COLS
+)
 _PATIENT_MEDICATIONS_SQL = """
 SELECT {cols}, count(*) AS n_occurrences
-FROM read_parquet({{files}})
+FROM (
+  SELECT {select_cols}
+  FROM read_parquet({{files}})
+)
 GROUP BY {cols}
-""".format(cols=", ".join(_PATIENT_MEDICATIONS_COLS))
+""".format(cols=", ".join(_PATIENT_MEDICATIONS_COLS), select_cols=_PATIENT_MEDICATIONS_SELECT_COLS)
 
 
 def build_patient_medications(catalog):
@@ -384,7 +425,7 @@ def build_patient_medications(catalog):
     df["_silver_built_at"] = datetime.now(timezone.utc)
 
     n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
-    n_expected = 27773144  # distinct row count, verified by hand
+    n_expected = 27773144  # unchanged by trim pass -- verified 0 real merges (see above)
     if len(df) != n_expected:
         raise AssertionError(
             f"patient_medications: expected {n_expected:,} distinct rows, got {len(df):,} "
@@ -404,14 +445,27 @@ def build_patient_medications(catalog):
 # complication values (21 groups, 42 rows) duplicate the same way, grep-verified real.
 # Collapsed to one row per group, repeat count kept as n_occurrences -- unlike
 # patient_medications there is no dose/quantity column at risk here.
+# Trim pass (2026-08-27, global standardization): trimmed all 4 categorical string
+# columns (LOG_ID/MRN left untouched). Checked impact first: 0 merges -- purely cosmetic.
 _PATIENT_POST_OP_COMPLICATIONS_COLS = [
     "LOG_ID", "MRN", "Element_Name", "CONTEXT_NAME", "Element_abbr", "SMRTDTA_ELEM_VALUE",
 ]
+_PATIENT_POST_OP_COMPLICATIONS_TRIM_COLS = {
+    "Element_Name", "CONTEXT_NAME", "Element_abbr", "SMRTDTA_ELEM_VALUE",
+}
+_PATIENT_POST_OP_COMPLICATIONS_SELECT_COLS = ", ".join(
+    f"trim({c}) AS {c}" if c in _PATIENT_POST_OP_COMPLICATIONS_TRIM_COLS else c
+    for c in _PATIENT_POST_OP_COMPLICATIONS_COLS
+)
 _PATIENT_POST_OP_COMPLICATIONS_SQL = """
 SELECT {cols}, count(*) AS n_occurrences
-FROM read_parquet({{files}})
+FROM (
+  SELECT {select_cols}
+  FROM read_parquet({{files}})
+)
 GROUP BY {cols}
-""".format(cols=", ".join(_PATIENT_POST_OP_COMPLICATIONS_COLS))
+""".format(cols=", ".join(_PATIENT_POST_OP_COMPLICATIONS_COLS),
+           select_cols=_PATIENT_POST_OP_COMPLICATIONS_SELECT_COLS)
 
 
 def build_patient_post_op_complications(catalog):

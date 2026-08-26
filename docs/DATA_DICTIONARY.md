@@ -824,14 +824,32 @@ per-model imputation/encoding choices, cohort scoping for a specific question) a
 deliberately out of scope for this checklist — those get designed per model, not here.
 
 **Cross-table / global rules (apply to every table):**
-- [ ] *[casing]* Normalize `LOG_ID`/`MRN` casing everywhere — `mrn` is lowercase in
-      `patient_history`/`patient_visit`, `MRN` uppercase elsewhere. Silent join failures
-      otherwise.
-- [ ] *[standardization]* One universal trim-and-normalize pass over every categorical
-      string column (leading/trailing whitespace + casing variants) — this exact pattern
-      recurred independently in `patient_medications.PRIMARY_ANES_TYPE_NM` ("MAC"),
-      `flowsheets.FLO_NAME`/`UNITS` (at massive scale), `patient_medications
-      .ORDER_STATUS_NM` ("0 " prefix). Handle once as a standard step, not per-column.
+- [x] *[casing]* `LOG_ID`/`MRN` casing normalized across all 7 built tables (2026-08-27)
+      — `patient_history`/`patient_visit` renamed lowercase `mrn` → `MRN`, matching
+      `patient_information`/`patient_lda`/`patient_coding`/`patient_medications`/
+      `patient_post_op_complications`. Pure rename, no data or row-count change; verified
+      all 7 tables now expose `MRN` (not `mrn`) after rebuild. `flowsheets`/`patient_labs`
+      remain unbuilt, so their casing fix is still pending along with everything else
+      about those two tables.
+- [x] *[standardization]* Universal trim pass applied to every categorical string column
+      across the 5 tables that hadn't already been trimmed (`patient_information` and
+      `patient_lda` already did their own full trim when built). **Correction made during
+      this pass**: the pre-implementation impact check compared each column's `DISTINCT`
+      count before/after trim in isolation, which found apparent "merges" (`patient_coding
+      .NAME`: 1; `patient_medications.DISPLAY_NAME`: 15) — but a single column's cardinality
+      dropping doesn't mean two rows sharing every *other* dedup-key column collided; it
+      can just as easily be two unrelated rows (different `MRN`) that happened to share a
+      whitespace-variant value. The actual rebuild came back with unchanged row counts,
+      exposing the error. Correctly re-checked against the full group-by tuple for both
+      tables: **0 real merges** in every one of the 5 tables. Trimming was still applied
+      (defensive/cosmetic — cleans standalone whitespace values with no risk), but no
+      table's row count or `n_occurrences` values changed as a result. `PRIMARY_ANES_TYPE_NM`
+      ("MAC") was already trimmed as part of `patient_information`'s own build;
+      `patient_medications.ORDER_STATUS_NM`'s `"0 "` prefix is confirmed **not** a
+      whitespace issue (literal `"0 Dispensed"`/`"0 Discontinued"` — `trim()` correctly
+      produces 0 merges there) and remains a separate, unstarted fix.
+      `flowsheets.FLO_NAME`/`UNITS` (unbuilt table, massive scale) still needs this pass
+      whenever that table gets built.
 
 **`patient_information`:** — **implemented in `scripts/build_silver.py::build_patient_information`, 2026-08-23.**
 - [x] *[dedup]* 1,374 excess rows on `LOG_ID` resolved. Row content was inspected: 1,364

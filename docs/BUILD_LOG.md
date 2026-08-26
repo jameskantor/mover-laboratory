@@ -645,3 +645,43 @@ getting explicit approval (per the process from the previous entry), fixed:
 
 Both `silver.patient_information` and `silver.patient_lda` were dropped and rebuilt
 (schema changes needed fresh tables, same as `patient_medications`'s revision earlier).
+
+## 2026-08-27 — Global casing/trim pass across all 7 built tables
+
+Closed out the two long-standing cross-table checklist items: `LOG_ID`/`MRN` casing
+consistency and a universal whitespace-trim pass. `patient_history`/`patient_visit`
+renamed their lowercase `mrn` column to `MRN`, matching the other five tables — pure
+rename, no data or row-count change, confirmed by directly re-checking column names
+across all 7 tables after rebuild. Trim was applied to every categorical string column
+in the 5 tables that hadn't already been trimmed (`patient_information`/`patient_lda`
+did their own full trim during their original builds).
+
+**Real methodology mistake, caught by the rebuild itself, not by a human catching it
+this time.** Before implementing, checked impact by comparing each column's `DISTINCT`
+count before/after `trim()` in isolation — `patient_coding.NAME` and
+`patient_medications.DISPLAY_NAME` looked like they'd merge 1 and 15 groups
+respectively, so the plan (and its approval) stated specific expected row-count drops.
+Implemented and ran the rebuild — both tables' assertions failed, row counts came back
+completely unchanged. The per-column check was measuring the wrong thing: a column's
+distinct-value count dropping after trim only proves *some* two rows *somewhere* in the
+table share a whitespace-variant value — it says nothing about whether those two rows
+are otherwise identical across the table's *full* dedup key (same `MRN`, same
+`SOURCE_KEY`, etc.). They weren't — the "merges" were between unrelated rows for
+different patients. Re-checked correctly against the full group-by tuple
+(`count(DISTINCT (col1, col2, ...))` before/after) and got 0 real merges for both
+tables, matching what the rebuild had already shown. Fixed both assertions back to the
+original (unchanged) expected row counts and re-ran successfully.
+
+Final state, verified directly against every table: all 7 built silver tables expose
+`MRN` (uppercase, consistent), and every row count matches its pre-pass value exactly —
+`patient_information` 64,360, `patient_lda` 412,312, `patient_history` 437,721,
+`patient_visit` 131,455, `patient_coding` 1,244,633, `patient_medications` 27,773,144,
+`patient_post_op_complications` 84,776. Trimming was still worth applying even at zero
+merge impact — it cleans standalone whitespace values with no downside — but the
+row-count-change claim in the original approved plan was wrong, and is corrected here
+rather than left standing.
+
+Remaining from the original global checklist item: `flowsheets.FLO_NAME`/`UNITS` still
+need this same trim pass whenever that table gets built (unbuilt, and the pattern there
+is large-scale — `"Vital Signs "` alone is 27.7% of the entire table, so unlike the 5
+tables just fixed, that one is very likely to have real merge impact).

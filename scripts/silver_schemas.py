@@ -102,30 +102,37 @@ SILVER_TABLES = {
     ]),
 
     "patient_history": _schema([
-        ("mrn", StringType(), True),
+        # Renamed from bronze's lowercase `mrn` (2026-08-27, global casing pass) -- every
+        # other silver table uses `MRN`; leaving this lowercase was a silent-join-failure
+        # risk for anyone joining across tables.
+        ("MRN", StringType(), True),
         ("diagnosis_code", StringType(), False),
         ("dx_name", StringType(), False),
         # Bronze has no encounter id for this table, so a diagnosis gets re-exported once
         # per clinical encounter that patient had -- confirmed real (grep-verified against
         # the raw source CSV), scaling ~1:1 with each patient's surgery count in
         # patient_information (1.09x for 1-surgery patients up to 52x for a 41-surgery
-        # patient). Collapsed to one row per (mrn, diagnosis_code, dx_name), with the
+        # patient). Collapsed to one row per (MRN, diagnosis_code, dx_name), with the
         # repeat count kept explicitly here instead of left as an implicit row count.
-        # Collapses 970,741 bronze rows to 437,721 distinct (mrn, diagnosis_code, dx_name).
+        # Collapses 970,741 bronze rows to 437,721 distinct groups (unchanged by the
+        # 2026-08-27 trim pass -- 0 merges for this table's string columns).
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
 
     "patient_visit": _schema([
         ("LOG_ID", StringType(), True),
-        ("mrn", StringType(), True),
+        # Renamed from bronze's lowercase `mrn` (2026-08-27, global casing pass) -- same
+        # reasoning as patient_history above.
+        ("MRN", StringType(), True),
         ("diagnosis_code", StringType(), False),
         ("dx_name", StringType(), False),
         # Unlike patient_history, this repeats WITHIN one encounter (57% of bronze rows),
         # grep-verified real in the source CSV -- likely one row per clinical note/document
         # that reiterates the visit's diagnosis list. Same treatment as patient_history:
-        # collapsed to one row per (LOG_ID, mrn, diagnosis_code, dx_name), repeat count
-        # kept explicitly. Collapses 219,257 bronze rows to 131,455 distinct groups.
+        # collapsed to one row per (LOG_ID, MRN, diagnosis_code, dx_name), repeat count
+        # kept explicitly. Collapses 219,257 bronze rows to 131,455 distinct groups
+        # (unchanged by the 2026-08-27 trim pass -- 0 merges for this table).
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
