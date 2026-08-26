@@ -590,7 +590,7 @@ already flagged.
 | `patient_history` | **Confirmed and investigated (2026-08-25) — real, mechanistic, dedup implemented** | 76% of rows (734,073/970,741) duplicated on `(mrn, diagnosis_code, dx_name)`. No encounter id in this table, so a chronic diagnosis re-exports once per clinical encounter — ratio scales ~1:1 with each patient's surgery count (1.09× to 52×), grep-confirmed real at the source. Silver collapses to 437,721 rows with an `n_occurrences` count — see "Silver-layer design checklist" below. |
 | `patient_visit` | **Confirmed and investigated (2026-08-25) — real, dedup implemented** | 57% of rows (125,405/219,257) duplicated on `(LOG_ID, mrn, diagnosis_code, dx_name)`, but *within* one encounter, not across encounters like `patient_history` — likely one row per clinical note reiterating the diagnosis list. Grep-confirmed real at the source. Silver collapses to 131,455 rows with an `n_occurrences` count. |
 | `patient_coding` | **Confirmed and investigated (2026-08-26) — real, dedup implemented** | 55% of rows (1,124,044/2,033,948) duplicated on `(MRN, SOURCE_KEY, SOURCE_NAME, NAME, REF_BILL_CODE_SET_NAME, REF_BILL_CODE)` — same no-encounter-id re-export-per-encounter mechanism as `patient_history`. Grep-confirmed real at the source (612× top group). Silver collapses to 1,244,633 rows with an `n_occurrences` count. Separately, 1 corrupted row found during the column audit (see above) — different issue, not part of this duplication. |
-| `patient_medications` | Not checked | Column audit found an `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue — different issue, not confirmed as row duplication |
+| `patient_medications` | **Confirmed and investigated (2026-08-26) — real, small-scale, dedup implemented** | Only 1.24% of rows (345,530/27,961,524) duplicated — a different, smaller-scale mechanism than the no-`LOG_ID` tables: this table has an encounter id, so it's a MAR action charted more than once per encounter (max group size 15), not a per-encounter re-export. Grep-confirmed real at the source. Silver collapses via plain `SELECT DISTINCT` to 27,773,144 rows. Separately still open: the `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue. |
 | `patient_post_op_complications` | Not checked | |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
@@ -879,9 +879,20 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       actually a mix of true CPT, Category III CPT, and HCPCS Level II. If a clean code
       system is needed downstream, derive it from the actual code format, not the label.
 
-**`patient_medications`:**
-- [ ] *[dedup]* **Never checked.**
+**`patient_medications`:** — **dedup implemented in `scripts/build_silver.py::build_patient_medications`, 2026-08-26.**
+- [x] *[dedup]* Different mechanism than `patient_history`/`patient_coding`: this table
+      HAS an encounter id (`LOG_ID`), and only 1.24% of bronze rows (345,530 of
+      27,961,524) were duplicated — much smaller scale, max group size 15 (not
+      hundreds). A MAR (medication administration) action charted more than once for
+      the same encounter, not a per-encounter re-export pattern. Grep-confirmed the top
+      group (15× — a `MAR Hold` for `sodium chloride 0.9% infusion` on one encounter)
+      real against the raw source CSV. Collapsed via plain `SELECT DISTINCT` — the
+      repeat count here is charting noise, not a chronicity signal like
+      `patient_history`'s, so no `n_occurrences` column was added. Verified in
+      production output: 27,773,144 rows (from 27,961,524 bronze), the known 15× group
+      collapses to exactly 1 row.
 - [ ] *[standardization]* Trim the `ORDER_STATUS_NM` `"0 "`-prefix variant (9,377 rows).
+      Not yet applied to silver output.
 - [ ] *[semantic, open]* Classify every `MAR_ACTION_NM` value (Given/Hold/Rate
       Verify/Rate Change/New Bag/etc.) into "counts as real drug exposure" vs.
       "logistics event" — open since 2026-08-20, blocks any dose/exposure feature.

@@ -504,3 +504,26 @@ collapses correctly on verification.
 
 Next: `patient_medications` and `patient_post_op_complications` still need their own
 duplicate-row audits before more of silver can be built.
+
+## 2026-08-26 — Silver build: `patient_medications` done
+
+Ran the `patient_medications` duplicate-row audit — a different shape than the last two
+tables. Only 1.24% of bronze rows (345,530/27,961,524) were duplicated, and the
+mechanism is different too: this table has an encounter id (`LOG_ID`), unlike
+`patient_history`/`patient_coding`, so the pervasive no-encounter-id re-export
+explanation doesn't apply here. Instead this is a MAR (medication administration) action
+getting charted more than once for the same encounter — the top group, 15 occurrences of
+a `MAR Hold` for `sodium chloride 0.9% infusion` on one specific `LOG_ID`, grep-confirmed
+as 15 literal matching lines in the raw source CSV, same discipline as the prior tables.
+Max group size across the whole table is 15, nowhere near `patient_history`'s 104 or
+`patient_coding`'s 612 — consistent with this being MAR-charting noise rather than a
+structural re-export pattern.
+
+Given the repeat count here doesn't carry real chronicity information the way it does in
+`patient_history`, `build_patient_medications` collapses via a plain `SELECT DISTINCT`
+rather than adding an `n_occurrences` column — the first table in this series to use that
+simpler treatment instead. Production run: 27,773,144 rows (from 27,961,524 bronze), the
+known 15× group collapses to exactly 1 row on verification.
+
+Next: `patient_post_op_complications` is the last table still gated on its own
+duplicate-row audit.

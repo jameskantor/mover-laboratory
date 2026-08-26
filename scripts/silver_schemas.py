@@ -138,4 +138,35 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_medications": _schema([
+        ("ENC_TYPE_C", LongType(), False),
+        ("ENC_TYPE_NM", StringType(), False),
+        ("LOG_ID", StringType(), True),
+        ("MRN", StringType(), True),
+        ("ORDERING_DATE", TimestampType(), False),
+        ("ORDER_CLASS_NM", StringType(), False),
+        ("MEDICATION_ID", LongType(), False),
+        ("DISPLAY_NAME", StringType(), False),
+        ("MEDICATION_NM", StringType(), False),
+        ("START_DATE", TimestampType(), False),
+        ("END_DATE", TimestampType(), False),
+        ("ORDER_STATUS_NM", StringType(), False),
+        ("RECORD_TYPE", StringType(), False),
+        ("MAR_ACTION_NM", StringType(), False),
+        ("MED_ACTION_TIME", TimestampType(), False),
+        ("ADMIN_SIG", DoubleType(), False),
+        ("DOSE_UNIT_NM", StringType(), False),
+        ("MED_ROUTE_NM", StringType(), False),
+        # Different mechanism than patient_history/patient_coding: this table HAS an
+        # encounter id (LOG_ID), and only 1.24% of bronze rows are duplicated (vs. 55-76%
+        # in the no-encounter-id tables), with a much smaller max group size (15, not
+        # hundreds) -- a MAR (medication administration) action getting charted more than
+        # once for the same encounter, not a per-encounter re-export pattern. Grep-verified
+        # the top group (15x) real against the raw source CSV. Collapsed via plain
+        # SELECT DISTINCT (no n_occurrences -- unlike patient_history's chronicity signal,
+        # this repeat count doesn't carry real information, it's charting noise).
+        # Collapses 27,961,524 bronze rows to 27,773,144 distinct rows.
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

@@ -339,12 +339,52 @@ def build_patient_coding(catalog):
     write_silver_table(catalog, "patient_coding", df)
 
 
+# --- patient_medications ------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_medications):
+# Different mechanism than patient_history/patient_coding: this table HAS an encounter id
+# (LOG_ID), and only 1.24% of bronze rows are duplicated (vs. 55-76% in the no-encounter-id
+# tables), with max group size 15 (not hundreds) -- a MAR action charted more than once for
+# the same encounter, not a per-encounter re-export pattern. Grep-verified the top group
+# (15x) real against the raw source CSV. Collapsed via plain SELECT DISTINCT -- unlike
+# patient_history's chronicity signal, this repeat count is charting noise, not carried
+# forward as n_occurrences.
+_PATIENT_MEDICATIONS_COLS = [
+    "ENC_TYPE_C", "ENC_TYPE_NM", "LOG_ID", "MRN", "ORDERING_DATE", "ORDER_CLASS_NM",
+    "MEDICATION_ID", "DISPLAY_NAME", "MEDICATION_NM", "START_DATE", "END_DATE",
+    "ORDER_STATUS_NM", "RECORD_TYPE", "MAR_ACTION_NM", "MED_ACTION_TIME", "ADMIN_SIG",
+    "DOSE_UNIT_NM", "MED_ROUTE_NM",
+]
+_PATIENT_MEDICATIONS_SQL = """
+SELECT DISTINCT {cols}
+FROM read_parquet({{files}})
+""".format(cols=", ".join(_PATIENT_MEDICATIONS_COLS))
+
+
+def build_patient_medications(catalog):
+    files = bronze_files(catalog, "patient_medications")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_MEDICATIONS_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 27773144  # distinct row count, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_medications: expected {n_expected:,} distinct rows, got {len(df):,} "
+            "-- dedup logic no longer matches the validated shape, stopping before write."
+        )
+    log.info(f"[patient_medications] {len(df):,} rows (from {n_bronze:,} bronze)")
+
+    write_silver_table(catalog, "patient_medications", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
     "patient_history": build_patient_history,
     "patient_visit": build_patient_visit,
     "patient_coding": build_patient_coding,
+    "patient_medications": build_patient_medications,
 }
 
 
