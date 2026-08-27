@@ -760,3 +760,41 @@ bronze exactly, the cited `Measurement_Units` conflict correctly remains two row
 
 Only `patient_procedure_events` is left — dedup rule still unresolved (bug vs. legitimate
 one-row-per-item charting convention, open since 2026-08-21).
+
+## 2026-08-27 — Silver build: `patient_procedure_events` done, all 10 tables built
+
+Resolved the last open dedup question in the warehouse: whether `patient_procedure_events`'
+size-2 duplicate pairs (93.8% of its duplicate groups, dominated by the event
+`Two Anti-Emetics Administered`) were a legitimate one-row-per-drug charting convention
+(the event name literally implies 2) or an export artifact, open since the original
+column audit on 2026-08-21.
+
+Tested and rejected the convention theory three ways: (1) only 60% of encounters with
+that event show exactly 2 rows — 40% (12,670 encounters) show just 1, a handful show 3
+or 4, inconsistent with a fixed "2 drugs = 2 rows" rule; (2) the duplication rate is
+wildly uneven across event types — true singular checkpoints (`Anesthesia Start`,
+`Sign In`, `Extubation`, etc.) sit at a uniform ~0.1–0.6% background rate (plausibly the
+same low-level export noise seen elsewhere in this warehouse), while
+`Two Anti-Emetics Administered` spikes to 74.2% of its own rows — two orders of
+magnitude above that floor, with nothing about the event's name explaining either
+number; (3) duplicate rows are byte-identical including `EVENT_TIME` to the minute —
+two real, distinct drug-administration events landing on the exact same timestamp with
+zero differentiating data is far more consistent with one action re-emitted than two
+real events. Grep-confirmed both a real size-2 pair (2 literal identical lines in the
+raw CSV) and the table's extreme `Mark Now` outlier (346 literal lines for that
+`LOG_ID`, 345 of them at the identical timestamp — a stuck-click-style charting glitch,
+not real events).
+
+`build_patient_procedure_events` collapses to one row per `(LOG_ID, MRN,
+EVENT_DISPLAY_NAME, EVENT_TIME, NOTE_TEXT)` — the full column set, nothing excluded
+from the key — repeat count kept as `n_occurrences`. Production run: 604,364 rows (from
+640,223 bronze), `sum(n_occurrences)` matches bronze exactly, the known 345× `Mark Now`
+group collapses to exactly `n_occurrences=345`.
+
+**This completes the silver build for all 10 bronze tables.** Remaining open items are
+per-column, not dedup: sentinel handling (`patient_labs`' `9999999.0`, `patient_history`/
+`patient_visit`'s `IMO0001`), semantic corrections (`patient_coding`'s CPT-vs-HCPCS
+mislabeling, `patient_information`'s backwards `PATIENT_CLASS_NM` subtypes), and a
+handful of standardization/missingness items — see `DATA_DICTIONARY.md`'s "Silver-layer
+design checklist" for the full per-table list. Gold-layer design (feature tables for a
+specific ML question) hasn't started.

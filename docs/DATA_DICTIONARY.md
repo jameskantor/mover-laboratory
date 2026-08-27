@@ -593,7 +593,7 @@ already flagged.
 | `patient_medications` | **Confirmed and investigated (2026-08-27) — export artifact, dedup implemented** | Only 1.24% of rows (345,530/27,961,524) duplicated. Full investigation (see "MAR duplicate-row investigation" above) confirmed this is an export/ETL artifact — contiguous multi-day duplicate blocks, one-time actions repeating at the identical second, the pattern recurring identically across one patient's multiple encounters — not charting noise and not periodic infusion-continuation checks. Silver collapses to `n_occurrences` (27,773,144 rows), matching `patient_history`/`patient_visit`/`patient_coding`'s treatment; never multiply `ADMIN_SIG` by `n_occurrences` for a dose/fluid total. Separately still open: the `ORDER_STATUS_NM` `"0 "`-prefix string-variant issue. |
 | `patient_post_op_complications` | **Confirmed and investigated (2026-08-27) — real, dedup implemented** | 79% of rows duplicated, 98% of that the generic `AN AQI POST-OP COMPLICATIONS` reporting flag (null value, up to 49×/encounter) — same re-emission-per-note mechanism as `patient_visit`. A small remainder of real complication values duplicates the same way, grep-confirmed real. Silver collapses to 84,776 rows with an `n_occurrences` count. |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
-| `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
+| `patient_procedure_events` | **Confirmed and investigated (2026-08-27) — real, dedup implemented** | 10.5% of rows duplicated. The "1 row per drug" theory for size-2 pairs (`Two Anti-Emetics Administered`) was tested and rejected — only 60% of encounters with that event show exactly 2 rows, and the duplication rate (74.2% of that event's own rows) is wildly out of line with every other event type's ~0.1–0.6% background rate. Grep-confirmed real at the source, including the 345× `Mark Now` outlier. Silver collapses to 604,364 rows with an `n_occurrences` count. |
 | `patient_labs` | **Confirmed and investigated (2026-08-27) — dedup implemented, original scope revised** | The originally-scoped 5-column key overcounted: 86% of what it called "duplicates" were rows with a genuinely different `Reference_Range` (673 groups) or `Abnormal_Flag` (43,060 groups) — real conflicting values, not duplicates. True exact-duplicate rate on the full 9-column key is far smaller: 15,072 rows (7,536 groups, 0.05%), grep-confirmed real at the source. Silver collapses those to `n_occurrences`, leaves the conflicting-value groups untouched. |
 | `flowsheets` | **Confirmed, investigated, and dedup implemented (2026-08-27)** | 63.6% of rows duplicated (916,048,965/1,440,918,933) — by far the highest rate in the warehouse. 133,971,114 distinct groups, median size 4, max 323 (a single static field re-emitted 323 times within one encounter — not plausibly a coincidence). Concentrated in `PRE-OP`/`POST-OP` core vitals (`Pulse`, `SpO2`, `Resp`, `BP`, `MAP`, etc.); `INTRA-OP` barely affected. Since `RECORDED_TIME` is part of the exact-match tuple, this is not "same value re-charted over time" (carry-forward) — it's the literal same row appearing multiple times. Two candidate mechanisms, neither confirmed: an export process re-emitting the full unchanged flowsheet state on every subsequent save event, or device-integrated vitals (bedside monitor → Epic) getting duplicated on retry without a dedup key. No public MOVER documentation of this found despite searching. Dedup applied regardless of unconfirmed root cause — see `build_silver.py::build_flowsheets` and "Silver-layer design checklist" below. |
 
@@ -1039,18 +1039,36 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
 - [ ] *[open]* `placement_instant` vs. `removal_instant` asymmetric null rate
       uninvestigated. Columns carried through to silver unchanged.
 
-**`patient_procedure_events`:**
-- [ ] *[dedup]* Collapse the extreme "Mark Now" outlier duplicates (up to 345 exact
-      copies — clear charting glitch).
-- [ ] *[dedup, open]* The size-2-pair majority (93.8% of duplicate groups) is
-      **unresolved bug-vs-convention** — don't dedup these until the drug/dose-field
-      investigation (flagged 2026-08-21) settles whether they're a legitimate
-      one-row-per-item charting pattern.
+**`patient_procedure_events`:** — **dedup implemented in `scripts/build_silver.py::build_patient_procedure_events`, 2026-08-27.**
+- [x] *[dedup]* 10.5% of bronze rows duplicated. The "1 row per drug" theory for size-2
+      groups (event name `Two Anti-Emetics Administered` implies exactly 2) was
+      investigated and **rejected**, three ways: **(1)** only 60% of encounters with that
+      event show exactly 2 rows — 40% (12,670 encounters) show just 1, and a small
+      number show 3 or 4, inconsistent with a fixed 2-rows-per-event convention.
+      **(2)** duplication rate is wildly uneven across event types — true singular
+      checkpoints (`Anesthesia Start`, `Sign In`, `Extubation`, etc.) sit at a uniform
+      ~0.1–0.6% background rate, while `Two Anti-Emetics Administered` spikes to
+      **74.2%** of its own rows, with `Quick Note` a distant second at 18.4% — nothing
+      about a name implying a count explains that rate, or why unrelated checkpoints
+      duplicate at the same small uniform floor. **(3)** duplicate rows are
+      byte-identical including `EVENT_TIME` to the minute — two real, distinct
+      drug-administration events landing on the exact same timestamp with zero
+      differentiating data is far more consistent with one action re-emitted than two
+      real events. Grep-confirmed both a real size-2 pair (2 literal identical lines in
+      the raw CSV) and the extreme `Mark Now` outlier (346 literal lines for that
+      `LOG_ID`, a clear stuck-click-style charting glitch — 345 of them landing on the
+      exact same timestamp). Collapsed to one row per `(LOG_ID, MRN,
+      EVENT_DISPLAY_NAME, EVENT_TIME, NOTE_TEXT)` — the full column set, nothing
+      excluded from the key — repeat count kept as `n_occurrences`. Verified in
+      production output: 604,364 rows (from 640,223 bronze), `sum(n_occurrences)`
+      matches the bronze row count exactly, the known 345× `Mark Now` group shows
+      `n_occurrences=345`.
 - [ ] *[accuracy]* The 2 extreme (~7-day) auto-close outliers are system artifacts, not
-      real durations — exclude from any duration-based feature, don't just clip.
+      real durations — exclude from any duration-based feature, don't just clip. No
+      silver code change — a gold-layer feature-computation rule, not a row-level fix.
 - [ ] *[not a defect]* `Anesthesia Stop` occurring after `Transported to PACU/ICU`
       (12.6% of encounters) is legitimate charting lag, confirmed by the user — leave as
-      real data, don't "fix."
+      real data, don't "fix." Carried through to silver unchanged.
 
 **`patient_labs`:** — **dedup implemented in `scripts/build_silver.py::build_patient_labs`, 2026-08-27.**
 - [x] *[dedup]* The originally-scoped narrow 5-column key (`LOG_ID, MRN, Lab_Code,

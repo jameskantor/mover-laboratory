@@ -273,4 +273,31 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_procedure_events": _schema([
+        ("LOG_ID", StringType(), True),
+        ("MRN", StringType(), True),
+        ("EVENT_DISPLAY_NAME", StringType(), False),
+        ("EVENT_TIME", TimestampType(), False),
+        ("NOTE_TEXT", StringType(), False),
+        # 10.5% of bronze rows duplicated. The "1 row per drug" theory for size-2 groups
+        # (event name `Two Anti-Emetics Administered` implies exactly 2) was investigated
+        # and rejected: (1) only 60% of encounters with that event show exactly 2 rows --
+        # 40% show just 1, and a handful show 3 or 4, inconsistent with a fixed 2-rows-per-
+        # event convention; (2) duplication rate is wildly uneven across event types --
+        # true singular checkpoints (Anesthesia Start, Sign In, Extubation, etc.) sit at a
+        # uniform ~0.1-0.6% background rate, while `Two Anti-Emetics Administered` spikes
+        # to 74.2% of its own rows -- nothing about the name implying a count explains that
+        # rate or why unrelated checkpoint events duplicate at the same small uniform floor;
+        # (3) duplicate rows are byte-identical including EVENT_TIME to the minute -- two
+        # real distinct drug-administration events landing on the exact same timestamp with
+        # zero differentiating data is far more consistent with one action re-emitted than
+        # two real events. Grep-confirmed both a real size-2 pair and the extreme 345x
+        # `Mark Now` outlier (a stuck-click-style charting glitch) as literal duplicate
+        # lines in the raw source CSV. Collapsed to one row per group (full column set,
+        # nothing excluded from the key), repeat count kept as n_occurrences.
+        # Collapses 640,223 bronze rows to 604,364 distinct groups.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

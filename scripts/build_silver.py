@@ -637,6 +637,45 @@ def build_patient_labs(catalog):
     write_silver_table(catalog, "patient_labs", df)
 
 
+# --- patient_procedure_events -------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_procedure_events):
+# the "1 row per drug" theory for size-2 groups (event name `Two Anti-Emetics Administered`
+# implies exactly 2) was investigated and rejected -- only 60% of encounters with that event
+# show exactly 2 rows (40% show 1, a handful show 3-4), duplication rate is wildly uneven
+# across event types (0.1-0.6% background for true singular checkpoints vs. 74.2% for this
+# one event, with no relationship to whether the name implies a count), and duplicate rows
+# are byte-identical including EVENT_TIME to the minute. Grep-confirmed both a real size-2
+# pair and the extreme 345x `Mark Now` outlier as literal duplicate lines in the raw CSV.
+# Collapsed to one row per group (full column set, nothing excluded from the key), repeat
+# count kept as n_occurrences.
+_PATIENT_PROCEDURE_EVENTS_COLS = ["LOG_ID", "MRN", "EVENT_DISPLAY_NAME", "EVENT_TIME", "NOTE_TEXT"]
+_PATIENT_PROCEDURE_EVENTS_SQL = """
+SELECT {cols}, count(*) AS n_occurrences
+FROM read_parquet({{files}})
+GROUP BY {cols}
+""".format(cols=", ".join(_PATIENT_PROCEDURE_EVENTS_COLS))
+
+
+def build_patient_procedure_events(catalog):
+    files = bronze_files(catalog, "patient_procedure_events")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_PROCEDURE_EVENTS_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 604364  # distinct group count, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_procedure_events: expected {n_expected:,} distinct groups, got "
+            f"{len(df):,} -- dedup logic no longer matches the validated shape, "
+            "stopping before write."
+        )
+    log.info(f"[patient_procedure_events] {len(df):,} rows (from {n_bronze:,} bronze), "
+             f"max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_procedure_events", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
@@ -647,6 +686,7 @@ BUILDERS = {
     "patient_post_op_complications": build_patient_post_op_complications,
     "flowsheets": build_flowsheets,
     "patient_labs": build_patient_labs,
+    "patient_procedure_events": build_patient_procedure_events,
 }
 
 
