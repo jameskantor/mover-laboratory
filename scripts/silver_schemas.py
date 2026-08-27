@@ -217,4 +217,30 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "flowsheets": _schema([
+        ("LOG_ID", StringType(), True),
+        ("MRN", StringType(), True),
+        ("FLO_NAME", StringType(), False),
+        ("FLO_DISPLAY_NAME", StringType(), False),
+        ("RECORD_TYPE", StringType(), False),
+        ("RECORDED_TIME", TimestampType(), False),
+        ("MEAS_VALUE_NUM", DoubleType(), False),
+        ("MEAS_VALUE_TXT", StringType(), False),
+        # Trimmed and casing/typo-normalized (cmH20->cmH2O, l/min->L/min, ml->mL); the
+        # 6-row CSV-escaping corruption found during the column audit (an unescaped quote
+        # in a free-text note spilling garbage into UNITS) is nulled here rather than kept.
+        ("UNITS", StringType(), False),
+        # 63.6% of bronze rows (916,048,965 of 1,440,918,933) were exact duplicates on the
+        # full 9-column tuple -- by far the highest rate in the warehouse, mechanism still
+        # unconfirmed (export re-emission vs. device-feed retry, see "Duplicate-row audit"
+        # in DATA_DICTIONARY.md), but collapsing is recommended regardless of root cause:
+        # a genuinely distinct reading landing on a fully identical tuple by chance is
+        # implausible at minute-granularity/this scale. Collapsed to one row per exact
+        # (LOG_ID, MRN, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME,
+        # MEAS_VALUE_NUM, MEAS_VALUE_TXT, UNITS) tuple, repeat count kept as
+        # n_occurrences -- same pattern as every other table in this batch.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

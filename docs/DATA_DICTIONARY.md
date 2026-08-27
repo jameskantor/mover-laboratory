@@ -595,7 +595,7 @@ already flagged.
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
 | `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
-| `flowsheets` | **Confirmed and investigated (2026-08-23) — mechanism still unconfirmed, dedup recommended regardless** | 63.6% of rows duplicated (916,048,965/1,440,918,933) — by far the highest rate in the warehouse. 133,971,114 distinct groups, median size 4, max 323 (a single static field re-emitted 323 times within one encounter — not plausibly a coincidence). Concentrated in `PRE-OP`/`POST-OP` core vitals (`Pulse`, `SpO2`, `Resp`, `BP`, `MAP`, etc.); `INTRA-OP` barely affected. Since `RECORDED_TIME` is part of the exact-match tuple, this is not "same value re-charted over time" (carry-forward) — it's the literal same row appearing multiple times. Two candidate mechanisms, neither confirmed: an export process re-emitting the full unchanged flowsheet state on every subsequent save event, or device-integrated vitals (bedside monitor → Epic) getting duplicated on retry without a dedup key. No public MOVER documentation of this found despite searching. See "Silver-layer design checklist" below for the recommended fix. |
+| `flowsheets` | **Confirmed, investigated, and dedup implemented (2026-08-27)** | 63.6% of rows duplicated (916,048,965/1,440,918,933) — by far the highest rate in the warehouse. 133,971,114 distinct groups, median size 4, max 323 (a single static field re-emitted 323 times within one encounter — not plausibly a coincidence). Concentrated in `PRE-OP`/`POST-OP` core vitals (`Pulse`, `SpO2`, `Resp`, `BP`, `MAP`, etc.); `INTRA-OP` barely affected. Since `RECORDED_TIME` is part of the exact-match tuple, this is not "same value re-charted over time" (carry-forward) — it's the literal same row appearing multiple times. Two candidate mechanisms, neither confirmed: an export process re-emitting the full unchanged flowsheet state on every subsequent save event, or device-integrated vitals (bedside monitor → Epic) getting duplicated on retry without a dedup key. No public MOVER documentation of this found despite searching. Dedup applied regardless of unconfirmed root cause — see `build_silver.py::build_flowsheets` and "Silver-layer design checklist" below. |
 
 ## MRN corruption and patient-level linkage
 
@@ -1065,22 +1065,39 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
 - [ ] *[cleanup]* `ENC_TYPE_NM` is constant (1 distinct value) — zero information,
       candidate to drop rather than carry forward.
 
-**`flowsheets`** (biggest table, biggest silver impact):
-- [ ] *[dedup]* Collapse the 63.6% duplication (916M/1.44B rows) to 1 row per exact
-      `(LOG_ID, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME, MEAS_VALUE_NUM,
-      MEAS_VALUE_TXT, UNITS)` tuple — see "Duplicate-row audit" above for the mechanism
-      discussion (unconfirmed root cause, but dedup is recommended regardless).
-- [ ] *[standardization]* Trim `FLO_NAME` whitespace duplicate (`"Vital Signs "` alone is
-      27.7% of the entire table) and `UNITS` casing/typo variants (`cmH20`/`cmH2O`,
-      `l/min`/`L/min`, `ml`/`mL`).
-- [ ] *[accuracy]* Fix/null the 6-row CSV-escaping bug (an unescaped quote in a free-text
-      note corrupted `UNITS` for those records).
-- [ ] *[missingness]* `RECORD_TYPE` (12.3% null) is scattered, not systematic — decide
-      null vs. an explicit `UNKNOWN` category based on downstream need.
+**`flowsheets`** (biggest table, biggest silver impact) — **implemented in `scripts/build_silver.py::build_flowsheets`, 2026-08-27.**
+- [x] *[dedup]* Collapsed the 63.6% duplication (916M/1.44B rows) to 1 row per exact
+      `(LOG_ID, MRN, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME,
+      MEAS_VALUE_NUM, MEAS_VALUE_TXT, UNITS)` tuple, repeat count kept as
+      `n_occurrences` — same pattern as every other table in this batch. Mechanism
+      remains unconfirmed (see "Duplicate-row audit" above); dedup applied regardless of
+      root cause. At ~1.44B bronze rows this table can't be materialized in a pandas
+      `DataFrame` the way the other six were — `write_silver_table_streaming` was added
+      instead: DuckDB streams the GROUP BY result as Arrow record batches
+      (`to_arrow_reader`, 10M rows/batch) directly into chunked `table.append()` calls,
+      bounding peak memory to one batch rather than the full ~659M-row result. Verified
+      in production output: 658,839,669 rows (from 1,440,918,933 bronze),
+      `sum(n_occurrences)` matches the bronze row count exactly, the known 323× outlier
+      group collapses to exactly `n_occurrences=323`. Build took ~10 minutes end to end.
+- [x] *[standardization]* `FLO_NAME` trimmed (confirmed no `"Vital Signs "` rows remain,
+      all 60.4M rows collapsed into the untrimmed `"Vital Signs"` form) and `UNITS`
+      casing/typo variants normalized (`cmH20`→`cmH2O`, `l/min`→`L/min`, `ml`→`mL`) —
+      done in the same pass as the dedup rather than a second 1.44B-row scan. Verified:
+      only the canonical forms remain post-build.
+- [x] *[accuracy]* The 6-row CSV-escaping bug is nulled: any `UNITS` value containing a
+      comma or double-quote (a real unit never contains either) is nulled before
+      grouping. Verified: 0 rows with a comma/quote in `UNITS` post-build.
+- [ ] *[missingness]* `RECORD_TYPE` (12.3% null) is scattered, not systematic — left
+      as-is (null), no code change made. Decide null vs. an explicit `UNKNOWN` category
+      based on downstream need if it ever matters for a specific model.
 - [ ] *[not a defect]* `FLO_DISPLAY_NAME`'s many-to-many relationship with `FLO_NAME` is
-      by design (same measurement reused across care-unit templates) — document, don't
-      "fix." Same for the 0.26% rows with neither `MEAS_VALUE_NUM` nor `MEAS_VALUE_TXT`
-      populated (normal sparse EHR grid behavior).
+      by design (same measurement reused across care-unit templates) — carried through
+      to silver unchanged, no fix needed. Same for the 0.26% rows with neither
+      `MEAS_VALUE_NUM` nor `MEAS_VALUE_TXT` populated (normal sparse EHR grid behavior).
+- [ ] *[open]* Unlike bronze, `silver.flowsheets` has no partition spec (matches the
+      other 6 built silver tables, none of which are partitioned) — at 659M rows this
+      may hurt query performance for anything that filters by year. Not addressed here;
+      revisit if it becomes a real bottleneck rather than pre-optimizing.
 
 ## Open items / TODO
 

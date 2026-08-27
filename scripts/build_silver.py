@@ -74,17 +74,58 @@ def ensure_silver_table(catalog, table_key):
         return catalog.create_table(identifier, schema=SILVER_TABLES[table_key])
 
 
-def write_silver_table(catalog, table_key, df):
+def pa_schema_for(table_key):
     schema = SILVER_TABLES[table_key]
     pa_fields = [pa.field(f.name, arrow_type_for(f), nullable=not f.required) for f in schema.fields]
-    pa_schema = pa.schema(pa_fields)
-    ordered_cols = [f.name for f in schema.fields]
+    return pa.schema(pa_fields)
+
+
+def write_silver_table(catalog, table_key, df):
+    pa_schema = pa_schema_for(table_key)
+    ordered_cols = [f.name for f in SILVER_TABLES[table_key].fields]
     df = df[ordered_cols]
     arrow_tbl = pa.Table.from_pandas(df, schema=pa_schema, preserve_index=False)
 
     table = ensure_silver_table(catalog, table_key)
     table.overwrite(arrow_tbl)  # full recompute each run, not an incremental append
     log.info(f"[{table_key}] wrote {len(df):,} rows to silver.{table_key}")
+
+
+def write_silver_table_streaming(catalog, table_key, sql, files, batch_rows=10_000_000):
+    """Same full-recompute contract as write_silver_table, but for tables too large to
+    round-trip through a pandas DataFrame (flowsheets: ~1.44B bronze rows). Streams the
+    query result as Arrow record batches straight from DuckDB into Iceberg via chunked
+    append() calls, so peak memory is bounded by batch_rows rather than the full result.
+    """
+    pa_schema = pa_schema_for(table_key)
+    ordered_cols = [f.name for f in SILVER_TABLES[table_key].fields if f.name != "_silver_built_at"]
+
+    con = duckdb.connect()
+    con.execute("PRAGMA memory_limit='24GB'")
+    result = con.execute(sql.format(files=files))
+    reader = result.to_arrow_reader(batch_rows)
+
+    table = ensure_silver_table(catalog, table_key)
+    table.overwrite(pa.Table.from_batches([], schema=pa_schema))  # clear prior run's data
+
+    now = datetime.now(timezone.utc)
+    n_rows = 0
+    n_batches = 0
+    for batch in reader:
+        batch_tbl = pa.Table.from_batches([batch])
+        batch_tbl = batch_tbl.select(ordered_cols)
+        batch_tbl = batch_tbl.append_column(
+            "_silver_built_at", pa.array([now] * batch_tbl.num_rows, type=pa.timestamp("us"))
+        )
+        batch_tbl = batch_tbl.cast(pa_schema)
+        table.append(batch_tbl)
+        n_rows += batch_tbl.num_rows
+        n_batches += 1
+        if n_batches % 25 == 0:
+            log.info(f"[{table_key}] streamed {n_rows:,} rows so far ({n_batches} batches)")
+
+    log.info(f"[{table_key}] wrote {n_rows:,} rows to silver.{table_key} ({n_batches} batches)")
+    return n_rows
 
 
 # --- patient_information --------------------------------------------------------------
@@ -488,6 +529,69 @@ def build_patient_post_op_complications(catalog):
     write_silver_table(catalog, "patient_post_op_complications", df)
 
 
+# --- flowsheets ----------------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Duplicate-row audit" -> flowsheets): 63.6% of bronze
+# rows (916,048,965 of 1,440,918,933) are exact duplicates on the full 9-column tuple -- by
+# far the highest rate in the warehouse. Mechanism still unconfirmed (export re-emission vs.
+# device-feed retry), but collapsing is recommended regardless of root cause: a genuinely
+# distinct reading landing on a fully identical tuple by chance is implausible at
+# minute-granularity/this scale, and the observed 323x outlier group already rules out
+# coincidence. Bundled into the same pass (one 1.44B-row scan instead of two): trim
+# FLO_NAME (the "Vital Signs " trailing-space duplicate alone is 27.7% of the whole table),
+# normalize UNITS casing/typo variants (cmH20->cmH2O, l/min->L/min, ml->mL), and null the
+# 6-row CSV-escaping corruption (an unescaped quote in a free-text note spilled garbage into
+# UNITS) -- detected here as any UNITS value containing a comma or quote, which a real unit
+# never does. RECORD_TYPE's 12.3% null rate and the 0.26% rows with neither
+# MEAS_VALUE_NUM/TXT populated are both confirmed normal EHR sparse-grid behavior, not
+# defects -- left untouched. FLO_DISPLAY_NAME's many-to-many relationship with FLO_NAME is
+# by design (different care-unit templates reusing the same measurement names) -- also
+# untouched. At ~1.44B bronze rows this cannot be materialized in pandas like every other
+# table here -- written via write_silver_table_streaming instead of write_silver_table.
+_FLOWSHEETS_SQL = """
+WITH normalized AS (
+  SELECT LOG_ID, MRN, trim(FLO_NAME) AS FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE,
+         RECORDED_TIME, MEAS_VALUE_NUM, MEAS_VALUE_TXT,
+         CASE
+           WHEN UNITS IS NULL THEN NULL
+           WHEN UNITS LIKE '%,%' OR UNITS LIKE '%"%' THEN NULL
+           WHEN trim(UNITS) = 'cmH20' THEN 'cmH2O'
+           WHEN trim(UNITS) = 'l/min' THEN 'L/min'
+           WHEN trim(UNITS) = 'ml' THEN 'mL'
+           ELSE trim(UNITS)
+         END AS UNITS
+  FROM read_parquet({files})
+)
+SELECT LOG_ID, MRN, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME,
+       MEAS_VALUE_NUM, MEAS_VALUE_TXT, UNITS, count(*) AS n_occurrences
+FROM normalized
+GROUP BY LOG_ID, MRN, FLO_NAME, FLO_DISPLAY_NAME, RECORD_TYPE, RECORDED_TIME,
+         MEAS_VALUE_NUM, MEAS_VALUE_TXT, UNITS
+"""
+
+
+def build_flowsheets(catalog):
+    files = bronze_files(catalog, "flowsheets")
+    con = duckdb.connect()
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    log.info(f"[flowsheets] bronze rows: {n_bronze:,} -- streaming dedup+write, this will take a while")
+
+    n_written = write_silver_table_streaming(catalog, "flowsheets", _FLOWSHEETS_SQL, files)
+
+    # Cheap post-write check instead of re-scanning bronze: sum(n_occurrences) must equal
+    # the bronze row count exactly -- guaranteed by GROUP BY semantics as long as no row
+    # was silently dropped or double-counted across the streaming batches.
+    table = catalog.load_table("silver.flowsheets")
+    sfiles = "[" + ",".join(f"'{t.file.file_path}'" for t in table.scan().plan_files()) + "]"
+    n_sum = con.execute(f"SELECT sum(n_occurrences) FROM read_parquet({sfiles})").fetchone()[0]
+    if int(n_sum) != n_bronze:
+        raise AssertionError(
+            f"flowsheets: sum(n_occurrences)={int(n_sum):,} != bronze rows {n_bronze:,} "
+            "-- some rows were lost or double-counted during the streaming write."
+        )
+    log.info(f"[flowsheets] verified: {n_written:,} silver rows, sum(n_occurrences)={int(n_sum):,} "
+             f"matches bronze exactly")
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
@@ -496,6 +600,7 @@ BUILDERS = {
     "patient_coding": build_patient_coding,
     "patient_medications": build_patient_medications,
     "patient_post_op_complications": build_patient_post_op_complications,
+    "flowsheets": build_flowsheets,
 }
 
 

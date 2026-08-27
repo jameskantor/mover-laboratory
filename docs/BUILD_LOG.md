@@ -685,3 +685,48 @@ Remaining from the original global checklist item: `flowsheets.FLO_NAME`/`UNITS`
 need this same trim pass whenever that table gets built (unbuilt, and the pattern there
 is large-scale — `"Vital Signs "` alone is 27.7% of the entire table, so unlike the 5
 tables just fixed, that one is very likely to have real merge impact).
+
+## 2026-08-27 — Silver build: `flowsheets` done — the last table, and the biggest by far
+
+Built the largest and most consequential table last, deliberately: `flowsheets` is
+1,440,918,933 bronze rows, ~2.5 orders of magnitude bigger than the next-largest table
+built so far (`patient_medications`, 28M). Every other silver table so far was built by
+pulling the full deduped result into a pandas `DataFrame` in one shot
+(`write_silver_table`) — that pattern flatly does not work here; a ~659M-row result with
+string/timestamp columns would not fit in memory as a `DataFrame`.
+
+Added `write_silver_table_streaming` to `scripts/build_silver.py`: DuckDB executes the
+same normalize-then-`GROUP BY` query used everywhere else, but instead of `.fetchdf()`
+the result is pulled as an Arrow `RecordBatchReader` (`to_arrow_reader(batch_rows=
+10_000_000)`) and each batch is cast to the target schema and appended to the Iceberg
+table directly — peak memory is bounded by one 10M-row batch, not the ~659M-row total.
+Validated the batch mechanics on a narrow real date-slice (`RECORDED_TIME < 2017-12-01`)
+before running the real thing, catching two issues cheaply instead of expensively: a
+Python `%`-format collision with the SQL's own `LIKE '%...%'` wildcards (switched to
+`.format()`, matching every other builder's pattern), and `fetch_record_batch()` being
+deprecated in this DuckDB version (1.5.5) in favor of `to_arrow_reader()`.
+
+**Dedup rule**, same reasoning as always: mechanism for the 63.6% duplication (916M
+rows) is still unconfirmed (see "Duplicate-row audit" in `DATA_DICTIONARY.md` — export
+re-emission vs. device-feed retry, neither proven), but collapsing to `n_occurrences` is
+recommended regardless of root cause, and it's cheap to bundle with the two
+already-scoped standardization fixes into a single 1.44B-row pass rather than three
+separate ones: `FLO_NAME` trimmed (`"Vital Signs "` alone was 27.7% of the whole table),
+`UNITS` casing/typo variants normalized (`cmH20`→`cmH2O`, `l/min`→`L/min`, `ml`→`mL`),
+and the 6-row CSV-escaping corruption nulled (any `UNITS` containing a comma or quote —
+a real unit never has either).
+
+Production run: 658,839,669 rows (from 1,440,918,933 bronze), took ~10 minutes end to
+end. Verified: `sum(n_occurrences)` matches the bronze row count exactly (guaranteed by
+`GROUP BY` semantics, cheap to check via a `sum()` over the much-smaller silver table
+rather than re-scanning bronze); the known 323× outlier group (a `[REMOVED]`-tagged
+static field re-emitted 323 times within one encounter) collapses to exactly
+`n_occurrences=323`; 0 rows have the pre-normalization `"Vital Signs "` / `cmH20` /
+`l/min` / `ml` variants remaining; 0 rows have a comma or quote in `UNITS`.
+
+**This completes the silver build for all 8 tables that have a resolved dedup rule** —
+`patient_information`, `patient_lda`, `patient_history`, `patient_visit`,
+`patient_coding`, `patient_medications`, `patient_post_op_complications`, and now
+`flowsheets`. `patient_labs` (0.38% exact duplicates, confirmed real, dedup rule already
+scoped) and `patient_procedure_events` (dedup rule still unresolved — bug vs. legitimate
+one-row-per-item charting convention, open since 2026-08-21) are the two tables left.
