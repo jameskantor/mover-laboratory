@@ -34,8 +34,20 @@ access is via `jupyter.ps1`, which also serves the tables over the network (Duck
 Quack remote protocol) alongside JupyterLab — confirmed working from both the native
 DuckDB CLI and DBeaver.
 
-**Silver / gold: not started.** See `docs/DATA_DICTIONARY.md` → "Open items" for the specific
-next steps (casing/unit fixes, then feature tables once an ML target is chosen).
+**Silver layer: done.** All 10 bronze tables have a cleaned, deduplicated, conformed
+silver counterpart — build it with:
+
+```
+python scripts/build_silver.py --all          # or --table <name> for one table
+python scripts/verify_silver.py                # independently re-checks the result
+```
+
+Every dedup/cleaning decision, per table, is in `docs/DATA_DICTIONARY.md`'s
+"Silver-layer design checklist"; the build history (including two real mistakes caught
+and fixed along the way) is in `docs/BUILD_LOG.md`.
+
+**Gold: not started.** Design is deliberately deferred until a specific ML question is
+chosen — see `docs/DATA_DICTIONARY.md` → "Open items" for candidate directions.
 
 ## Data sources
 

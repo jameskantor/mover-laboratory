@@ -7,12 +7,28 @@ patching. Run once per table:
     python scripts/build_silver.py --table patient_information
     python scripts/build_silver.py --all
 
+After building, run scripts/verify_silver.py to independently re-check every table's
+row counts against the live warehouse -- it doesn't trust this script's own assertions,
+it re-derives them.
+
 See docs/DATA_DICTIONARY.md's "Silver-layer design checklist" for the rationale behind
 every transform below -- this script is the implementation, that doc is the walkthrough.
+
+A note on the hardcoded `n_expected = <literal>` row counts in every build_* function
+below: these are deliberate, not a shortcut -- silver's only correctness check is "did
+today's run produce the same shape as the one a human verified by hand," so a silent
+change in dedup logic (or in the underlying MOVER source data, if it's ever re-
+downloaded/refreshed) fails loudly instead of writing something subtly wrong. The
+maintenance cost is real: if bronze data ever changes, every affected literal below has
+to be recomputed and updated by hand -- there's no migration tooling for that, it's a
+manual step. Recompute via the same query the comment above each literal describes,
+confirm the new shape by hand the same way the original investigation did, then update
+the literal and this comment together.
 """
 import argparse
 import logging
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,7 +37,7 @@ import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).parent))
 from catalog import get_catalog
-from silver_schemas import SILVER_TABLES
+from silver_schemas import SILVER_TABLES, partition_spec_for
 
 LOG_DIR = Path("/work/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,6 +51,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("build_silver")
+
+# PyIceberg's Table.overwrite() always issues a delete-then-append internally, so the
+# very first write to a freshly created (empty) table logs this warning every time --
+# harmless, but it reads like a failure in the build log. Narrowly silenced by message
+# text rather than blanket-suppressing warnings.
+warnings.filterwarnings("ignore", message="Delete operation did not match any records")
 
 
 def arrow_type_for(iceberg_field):
@@ -67,11 +89,50 @@ def bronze_files(catalog, table_key):
 
 
 def ensure_silver_table(catalog, table_key):
+    """Loads silver.<table_key>, creating it (with its partition spec, if any) on first
+    run. If the table already exists with an OLDER schema OR an out-of-date partition
+    spec -- the previous version of this script had no handling for either, and hit a
+    raw pyarrow ValueError three separate times this project (patient_information,
+    patient_lda, patient_medications) requiring a manual catalog.drop_table() outside
+    the script -- drop and recreate it automatically instead, logging what changed.
+    Silver is always fully recomputed from bronze on every run (see module docstring),
+    so losing the old silver data here is never a loss of information; bronze is
+    untouched either way. (Partition specs can't be changed on an existing table's
+    already-written files regardless -- this is the only correct way to apply one.)
+    """
+    from pyiceberg.exceptions import NoSuchTableError
+
     identifier = f"silver.{table_key}"
+    target_schema = SILVER_TABLES[table_key]
+    spec = partition_spec_for(table_key)
+    desired_spec_fields = spec.fields if spec is not None else ()
+
+    def _create():
+        kwargs = {"schema": target_schema}
+        if spec is not None:
+            kwargs["partition_spec"] = spec
+        return catalog.create_table(identifier, **kwargs)
+
     try:
-        return catalog.load_table(identifier)
-    except Exception:
-        return catalog.create_table(identifier, schema=SILVER_TABLES[table_key])
+        table = catalog.load_table(identifier)
+    except NoSuchTableError:
+        log.info(f"[{table_key}] silver.{table_key} doesn't exist yet, creating it"
+                 + (f" (partitioned by {spec.fields[0].name})" if spec else ""))
+        return _create()
+
+    schema_changed = table.schema() != target_schema
+    spec_changed = table.spec().fields != desired_spec_fields
+    if schema_changed or spec_changed:
+        reason = "schema" if schema_changed else "partition spec"
+        log.warning(f"[{table_key}] existing silver.{table_key} {reason} doesn't match "
+                    f"the current definition in silver_schemas.py -- dropping and "
+                    f"recreating it (expected after a schema/partitioning change; "
+                    f"silver is always fully recomputed from bronze, so no information "
+                    f"is lost).")
+        catalog.drop_table(identifier)
+        return _create()
+
+    return table
 
 
 def pa_schema_for(table_key):
@@ -91,9 +152,17 @@ def write_silver_table(catalog, table_key, df):
     log.info(f"[{table_key}] wrote {len(df):,} rows to silver.{table_key}")
 
 
+# Any table whose bronze row count crosses this threshold uses write_silver_table_streaming
+# instead of write_silver_table -- a plain pandas .fetchdf() round-trip of tens of millions
+# of rows works today, but it's an unnecessary and undocumented risk at that scale with no
+# stated rule for when to switch. This is that rule; see build_patient_labs/
+# build_patient_medications/build_flowsheets for the three tables currently over it.
+STREAMING_THRESHOLD_ROWS = 10_000_000
+
+
 def write_silver_table_streaming(catalog, table_key, sql, files, batch_rows=10_000_000):
-    """Same full-recompute contract as write_silver_table, but for tables too large to
-    round-trip through a pandas DataFrame (flowsheets: ~1.44B bronze rows). Streams the
+    """Same full-recompute contract as write_silver_table, but for tables too large (see
+    STREAMING_THRESHOLD_ROWS) to round-trip through a single pandas DataFrame. Streams the
     query result as Arrow record batches straight from DuckDB into Iceberg via chunked
     append() calls, so peak memory is bounded by batch_rows rather than the full result.
     """
@@ -128,15 +197,44 @@ def write_silver_table_streaming(catalog, table_key, sql, files, batch_rows=10_0
     return n_rows
 
 
+def verify_n_occurrences_sum(catalog, table_key, n_bronze):
+    """Post-write check for the streaming path, used in place of the pre-write len(df)
+    assertion the non-streaming builders use (streaming never materializes a full
+    DataFrame, so there's nothing to check row counts against before writing).
+    sum(n_occurrences) must equal the bronze row count exactly -- guaranteed by GROUP BY
+    semantics as long as no row was silently dropped or double-counted across batches.
+    Cheap to check via a sum() over the much-smaller silver table rather than
+    re-scanning bronze.
+    """
+    table = catalog.load_table(f"silver.{table_key}")
+    files = "[" + ",".join(f"'{t.file.file_path}'" for t in table.scan().plan_files()) + "]"
+    con = duckdb.connect()
+    n_sum = con.execute(f"SELECT sum(n_occurrences) FROM read_parquet({files})").fetchone()[0]
+    if int(n_sum) != n_bronze:
+        raise AssertionError(
+            f"{table_key}: sum(n_occurrences)={int(n_sum):,} != bronze rows {n_bronze:,} "
+            "-- some rows were lost or double-counted during the streaming write."
+        )
+    log.info(f"[{table_key}] verified: sum(n_occurrences)={int(n_sum):,} matches bronze exactly")
+
+
 # --- patient_information --------------------------------------------------------------
 # Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_information
 # and "MRN corruption and patient-level linkage" for the full derivation):
-#   1. Normalize: trim every string column, map the one confirmed DISCH_DISP wording
+#   1. Drop the one confirmed phantom row before anything else: LOG_ID 0c6b137659f5df02's
+#      second MRN (fc63c830038a1f83) is not a real second patient -- the "LOG_ID
+#      collisions" investigation found zero footprint for it in any encounter-level
+#      table, and its patient_history rows are a strict subset of the real patient's
+#      (18d889ebcda81db9) with a fabricated 2-months-later surgery date. This was
+#      diagnosed and the fix specified back on 2026-08-27 but never actually applied
+#      until this data-engineering review caught it still shipping -- fixed here.
+#   2. Normalize: trim every string column, map the one confirmed DISCH_DISP wording
 #      variant (code 69, mid-dataset Epic dictionary update) to its canonical text.
-#   2. SELECT DISTINCT collapses the 1,364 exact-duplicate LOG_IDs automatically.
-#   3. Of the 7 LOG_IDs still duplicated after that:
-#      - 3 are real LOG_ID collisions across different patients (MRN differs AND every
-#        other column differs) -- both rows are kept, flagged log_id_collision.
+#   3. SELECT DISTINCT collapses the 1,364 exact-duplicate LOG_IDs automatically.
+#   4. Of the 6 LOG_IDs still duplicated after that (7 minus the phantom row above):
+#      - 2 are real LOG_ID collisions across different patients (MRN differs AND every
+#        other column differs, both independently confirmed via real flowsheets data
+#        for both patients) -- both rows are kept, flagged log_id_collision.
 #      - 1 is an MRN-corruption artifact (MRN differs but every other column is
 #        identical, and the differing MRN values are the scientific-notation corrupted
 #        kind) -- collapsed to 1 row, flagged mrn_corrupt like any other corrupted MRN.
@@ -166,6 +264,8 @@ WITH normalized AS (
     trim(PRIMARY_PROCEDURE_NM) AS PRIMARY_PROCEDURE_NM,
     IN_OR_DTTM, OUT_OR_DTTM, AN_START_DATETIME, AN_STOP_DATETIME
   FROM read_parquet({files})
+  -- phantom row, see comment above: not a real patient, drop before classification
+  WHERE NOT (LOG_ID = '0c6b137659f5df02' AND MRN = 'fc63c830038a1f83')
 ),
 tagged AS (
   SELECT *,
@@ -219,7 +319,7 @@ def build_patient_information(catalog):
     df["_silver_built_at"] = datetime.now(timezone.utc)
 
     n_expected_distinct = 64354  # matches the MOVER paper's stated EPIC surgery count
-    n_expected_rows = 64360  # 64357 + 3 extra rows from keeping both has_conflicting_duplicate rows
+    n_expected_rows = 64359  # 64360 - 1 phantom row (0c6b137659f5df02/fc63c830038a1f83) dropped
     n_distinct = df["LOG_ID"].nunique()
     if n_distinct != n_expected_distinct or len(df) != n_expected_rows:
         raise AssertionError(
@@ -460,21 +560,24 @@ GROUP BY {cols}
 
 
 def build_patient_medications(catalog):
+    # At 27.96M bronze rows this crosses STREAMING_THRESHOLD_ROWS -- was previously the
+    # only large table not using the streaming path (data-engineering review,
+    # 2026-08-27: no documented rule existed for when a table needs it, and this one
+    # happened to work via a full pandas .fetchdf() round-trip, but with no stated
+    # threshold the next similarly-sized table had no guidance either way).
     files = bronze_files(catalog, "patient_medications")
     con = duckdb.connect()
-    df = con.execute(_PATIENT_MEDICATIONS_SQL.format(files=files)).fetchdf()
-    df["_silver_built_at"] = datetime.now(timezone.utc)
-
     n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
-    n_expected = 27773144  # unchanged by trim pass -- verified 0 real merges (see above)
-    if len(df) != n_expected:
-        raise AssertionError(
-            f"patient_medications: expected {n_expected:,} distinct rows, got {len(df):,} "
-            "-- dedup logic no longer matches the validated shape, stopping before write."
-        )
-    log.info(f"[patient_medications] {len(df):,} rows (from {n_bronze:,} bronze)")
+    log.info(f"[patient_medications] bronze rows: {n_bronze:,} -- streaming dedup+write")
 
-    write_silver_table(catalog, "patient_medications", df)
+    n_written = write_silver_table_streaming(catalog, "patient_medications", _PATIENT_MEDICATIONS_SQL, files)
+    n_expected = 27773144  # unchanged by trim pass -- verified 0 real merges (see above)
+    if n_written != n_expected:
+        raise AssertionError(
+            f"patient_medications: expected {n_expected:,} rows, got {n_written:,} "
+            "-- dedup logic no longer matches the validated shape."
+        )
+    verify_n_occurrences_sum(catalog, "patient_medications", n_bronze)
 
 
 # --- patient_post_op_complications --------------------------------------------------------
@@ -575,21 +678,8 @@ def build_flowsheets(catalog):
     n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
     log.info(f"[flowsheets] bronze rows: {n_bronze:,} -- streaming dedup+write, this will take a while")
 
-    n_written = write_silver_table_streaming(catalog, "flowsheets", _FLOWSHEETS_SQL, files)
-
-    # Cheap post-write check instead of re-scanning bronze: sum(n_occurrences) must equal
-    # the bronze row count exactly -- guaranteed by GROUP BY semantics as long as no row
-    # was silently dropped or double-counted across the streaming batches.
-    table = catalog.load_table("silver.flowsheets")
-    sfiles = "[" + ",".join(f"'{t.file.file_path}'" for t in table.scan().plan_files()) + "]"
-    n_sum = con.execute(f"SELECT sum(n_occurrences) FROM read_parquet({sfiles})").fetchone()[0]
-    if int(n_sum) != n_bronze:
-        raise AssertionError(
-            f"flowsheets: sum(n_occurrences)={int(n_sum):,} != bronze rows {n_bronze:,} "
-            "-- some rows were lost or double-counted during the streaming write."
-        )
-    log.info(f"[flowsheets] verified: {n_written:,} silver rows, sum(n_occurrences)={int(n_sum):,} "
-             f"matches bronze exactly")
+    write_silver_table_streaming(catalog, "flowsheets", _FLOWSHEETS_SQL, files)
+    verify_n_occurrences_sum(catalog, "flowsheets", n_bronze)
 
 
 # --- patient_labs -------------------------------------------------------------------------
@@ -619,22 +709,21 @@ GROUP BY {cols}
 
 
 def build_patient_labs(catalog):
+    # 29.08M bronze rows -- crosses STREAMING_THRESHOLD_ROWS, same reasoning as
+    # patient_medications above (data-engineering review, 2026-08-27).
     files = bronze_files(catalog, "patient_labs")
     con = duckdb.connect()
-    df = con.execute(_PATIENT_LABS_SQL.format(files=files)).fetchdf()
-    df["_silver_built_at"] = datetime.now(timezone.utc)
-
     n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
-    n_expected = 29071808  # distinct group count, verified by hand
-    if len(df) != n_expected:
-        raise AssertionError(
-            f"patient_labs: expected {n_expected:,} distinct groups, got {len(df):,} "
-            "-- dedup logic no longer matches the validated shape, stopping before write."
-        )
-    log.info(f"[patient_labs] {len(df):,} rows (from {n_bronze:,} bronze), "
-             f"max n_occurrences={df['n_occurrences'].max()}")
+    log.info(f"[patient_labs] bronze rows: {n_bronze:,} -- streaming dedup+write")
 
-    write_silver_table(catalog, "patient_labs", df)
+    n_written = write_silver_table_streaming(catalog, "patient_labs", _PATIENT_LABS_SQL, files)
+    n_expected = 29071808  # distinct group count, verified by hand
+    if n_written != n_expected:
+        raise AssertionError(
+            f"patient_labs: expected {n_expected:,} distinct groups, got {n_written:,} "
+            "-- dedup logic no longer matches the validated shape."
+        )
+    verify_n_occurrences_sum(catalog, "patient_labs", n_bronze)
 
 
 # --- patient_procedure_events -------------------------------------------------------------

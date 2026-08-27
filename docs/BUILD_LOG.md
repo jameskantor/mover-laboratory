@@ -798,3 +798,73 @@ mislabeling, `patient_information`'s backwards `PATIENT_CLASS_NM` subtypes), and
 handful of standardization/missingness items — see `DATA_DICTIONARY.md`'s "Silver-layer
 design checklist" for the full per-table list. Gold-layer design (feature tables for a
 specific ML question) hasn't started.
+
+## 2026-08-27 — Data-engineering review of the finished silver layer; 11 findings fixed
+
+With all 10 tables built, asked for an independent architecture/operations review — not
+dedup-logic correctness (the supervisor review a few commits back already covered that),
+but the surrounding engineering: partitioning, schema-change handling, write-strategy
+consistency, reproducibility docs, and whether a previously-diagnosed bug had actually
+shipped fixed. Full writeup with all 11 findings: `docs/DATA_DICTIONARY.md` →
+"Data-engineering review (2026-08-27)". The two that mattered most:
+
+**A known bug had never actually been fixed.** Back when investigating `LOG_ID`
+collisions, `0c6b137659f5df02`'s second `MRN` (`fc63c830038a1f83`) was diagnosed as a
+phantom row — zero clinical footprint anywhere, a subset-copy of the real patient's
+diagnosis history with a fabricated surgery date — and the fix (drop it, keep only the
+real row) was specified in the checklist. It never got coded. It shipped in every
+subsequent silver build, survived the supervisor review, and was still there when this
+review checked the live table directly. Fixed now in `_PATIENT_INFORMATION_SQL`; the row
+is filtered out before classification runs. `log_id_collision` dropped from 6 rows to 4,
+total silver rows from 64,360 to 64,359, distinct `LOG_ID` unchanged at 64,354.
+`scripts/verify_silver.py` checks for this specific row going forward, specifically so
+"diagnosed but never applied" can't happen silently again.
+
+**Silver had silently dropped bronze's partitioning.** `DATA_DICTIONARY.md`'s own
+Architecture section states that `flowsheets`/`patient_labs`/`patient_medications` are
+partitioned by year for query pruning — true in bronze, never carried into
+`silver_schemas.py` when silver was written. Reinstated via a new
+`partition_spec_for()` helper (looks up the source column's field id via
+`Schema.find_field()` rather than hardcoding it, so it stays correct if column order
+ever changes) — same source column and year transform as bronze for all three tables.
+
+Applying a partition spec to an already-written table isn't possible after the fact, so
+all three needed a full rebuild. That surfaced the next fix: `ensure_silver_table()` had
+no handling for "the schema or partition spec changed since this table was created" at
+all — three separate times this project (`patient_information`, `patient_lda`,
+`patient_medications`, across earlier sessions), that hit a raw `pyarrow.ValueError`
+requiring a manual `catalog.drop_table()` outside the script, with nothing documented
+about it. Now it compares both the existing table's schema and partition spec against
+the current definitions in `silver_schemas.py` and auto-drops/recreates on a mismatch,
+logging what changed — confirmed working live: rebuilding `patient_labs` and
+`patient_medications` both correctly logged `"partition spec doesn't match... dropping
+and recreating"` and proceeded without manual intervention.
+
+Also fixed while in there: a bare `except Exception` in `ensure_silver_table` (was
+catching everything, not just "table doesn't exist," now catches
+`pyiceberg.exceptions.NoSuchTableError` specifically); `patient_medications` (28M rows)
+and `patient_labs` (29M rows) switched from a plain pandas round-trip to the same
+streaming Arrow-batch writer `flowsheets` already used, with an explicit
+`STREAMING_THRESHOLD_ROWS` (10M) constant so the next large table has a documented rule
+instead of an ad hoc per-table decision; `README.md`'s Status section and
+`DATA_DICTIONARY.md`'s top-level "Open items" checklist both updated (they'd drifted —
+still said "Silver / gold: not started" days after silver finished); the
+`n_occurrences`-and-never-multiply-`ADMIN_SIG`-by-it warning promoted from one inline
+table row to its own subsection in the Architecture section; a cosmetic
+`UserWarning: Delete operation did not match any records` silenced (harmless, but every
+build was logging it as if something failed); a stale `silver.vitals` table-name
+reference corrected to `silver.flowsheets`; and `scripts/verify_silver.py` added —
+independent post-build verification (re-derives `sum(n_occurrences) == bronze row
+count` for the 9 applicable tables, plus bespoke checks for `patient_information`
+including a standing regression test for the phantom-row fix above), the first
+automated check this project has had anywhere.
+
+Rebuilt `patient_information` (64,359 rows, `log_id_collision`=4, verified via
+`verify_silver.py`), `patient_labs` (29,071,808 rows, `sum(n_occurrences)` matches
+bronze exactly), `patient_medications` (27,773,144 rows, same), and `flowsheets`
+(re-running with the new partition spec applied — the 1.44B-row streaming build takes
+~10 minutes).
+
+Not done as part of this review: a real test suite / CI, and a from-scratch pipeline
+re-run (bronze → silver → verify) to confirm the whole thing still reproduces end to end
+after all of the above.

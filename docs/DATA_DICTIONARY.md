@@ -504,18 +504,47 @@ exact duplicates or genuinely different rows sharing a `LOG_ID`.
 - **Bronze**: one Iceberg table per source file (9 EMR tables + flowsheets), typed
   per the corrections above, minimal transformation otherwise.
 - **Silver**: cleaned + conformed, consistent `LOG_ID`/`MRN` casing across all tables so
-  DuckDB joins work directly. Not aggregated — `silver.vitals` still has ~1.44B rows,
-  just cleaned and typed.
+  DuckDB joins work directly. Not aggregated — `silver.flowsheets` still has ~659M rows
+  after dedup, just cleaned, typed, and deduplicated.
 - **Gold**: per-model, denormalized feature+label tables produced by a feature-engineering
   SQL query against silver (e.g. `gold.icu_transfer_features`, one row per surgery).
   Built on demand per ML question, not up front.
 
-Partitioning: flowsheets/labs/meds by year (via Iceberg's `years()` transform on the
-relevant timestamp column, not a manually derived year column) — organizes files for
+Partitioning: `flowsheets`/`patient_labs`/`patient_medications` are partitioned by year
+in **both** bronze and silver (via Iceberg's `years()` transform on the relevant
+timestamp column, not a manually derived year column) — organizes files for
 query-time partition pruning. This is a query-speed optimization, not a storage-size
 optimization — the actual space savings vs. raw CSV come from Parquet's columnar
 encoding (dictionary encoding on low-cardinality columns like `FLO_NAME`, type-aware
-numeric encoding, block compression), not from partitioning.
+numeric encoding, block compression), not from partitioning. *(Silver's partitioning was
+silently dropped for a few days after these 3 tables were first built — the
+data-engineering review below caught it; reinstated in `silver_schemas.py`'s
+`partition_spec_for()`.)*
+
+### `n_occurrences`: what it means, and the one rule that matters
+
+Nine of the ten silver tables carry an `n_occurrences` column (every table except
+`patient_information`, which uses row-level boolean flags instead — see its own section
+above). In every case it means the same thing: **how many bronze rows collapsed into
+this one silver row**, kept explicitly rather than left as an implicit, easy-to-lose row
+count. The mechanism behind the duplication differs per table (re-export-per-encounter,
+export/ETL artifact, charting noise — see each table's own writeup for specifics), but
+the column's meaning doesn't.
+
+**The one rule that matters: `n_occurrences` is never a count of real repeated events.**
+It reflects how many times bronze re-exported or re-charted the same underlying fact,
+not how many times that fact actually happened. Concretely, in `patient_medications`:
+**never multiply `ADMIN_SIG` (dose) by `n_occurrences`** to compute a patient's
+medication or fluid total — that would conflate export duplication with real repeat
+administration, silently fabricating a wrong total with no error to catch it. Any table
+with both `n_occurrences` and a quantitative column carries this same risk; today that's
+only `patient_medications`, since every other `n_occurrences` table's remaining columns
+are categorical/label data where "how many times charted" isn't a value at risk of being
+scaled into something wrong.
+
+`scripts/verify_silver.py` checks `sum(n_occurrences) == bronze row count` for all nine
+tables after every build — the cheapest possible guard against a future dedup change
+silently dropping or double-counting rows.
 
 ## Ingestion log
 
@@ -813,6 +842,67 @@ row-deleting `SELECT DISTINCT` used the day before. `n_occurrences` must never b
 multiplied against `ADMIN_SIG` to compute a dose/fluid total — that conflates export
 duplication with real repeat administration; totals are a deliberate gold-layer decision.
 
+## Data-engineering review (2026-08-27)
+
+An independent review of the finished silver layer — not dedup-logic correctness (the
+supervisor review above already covered that), but architecture and operational
+decisions: partitioning, schema-change handling, write-strategy consistency,
+reproducibility docs, and whether a previously-diagnosed bug had actually been fixed.
+11 findings, all fixed the same day:
+
+1. **Silver had dropped bronze's year-partitioning** on `flowsheets`/`patient_labs`/
+   `patient_medications` — the Architecture section above states this partitioning
+   exists specifically for query pruning, but `silver_schemas.py` never carried it
+   forward. Reinstated via `partition_spec_for()`, same source column/transform as
+   bronze; all three tables rebuilt from scratch to apply it (partition specs can't be
+   added to an existing table's already-written files after the fact).
+2. **The `0c6b137659f5df02` phantom-row fix, diagnosed 2026-08-27, had never actually
+   been applied** — still shipping in every silver build since, including through a full
+   supervisor review that didn't catch it either. Fixed in `_PATIENT_INFORMATION_SQL`;
+   `scripts/verify_silver.py` now checks for this specific row as a standing regression
+   test so this class of "known but unapplied" bug can't silently reappear.
+3. **No schema-migration path.** Three separate incidents this project
+   (`patient_information`, `patient_lda`, `patient_medications`) hit a raw
+   `pyarrow.ValueError` requiring a manual `catalog.drop_table()` outside the script
+   after a schema change. `ensure_silver_table()` now detects a schema mismatch and
+   drops/recreates automatically, logging what changed — silver is always fully
+   recomputed from bronze, so this never loses information.
+4. **Bare `except Exception`** in `ensure_silver_table()` caught everything, not just
+   "table doesn't exist yet" — a transient catalog error would have been silently
+   misreported as "needs creating." Now catches `pyiceberg.exceptions.NoSuchTableError`
+   specifically.
+5. **Reproducibility docs had drifted from actual state** — `README.md` still said
+   "Silver / gold: not started" and never mentioned `build_silver.py`; this doc's own
+   top-level "Open items / TODO" still showed "Design silver layer" unchecked days after
+   it finished. Both updated; README now documents the full bronze → silver →
+   `verify_silver.py` sequence.
+6. **Inconsistent write strategy at scale, no documented threshold.** `flowsheets`
+   (1.44B rows) got a dedicated streaming writer; `patient_medications` (28M) and
+   `patient_labs` (29M) didn't, with no stated rule for when a table needs one.
+   `STREAMING_THRESHOLD_ROWS` (10M) now makes this an explicit, checkable rule; both
+   tables switched to the streaming path for consistency.
+7. **The one warning that actually prevents a silently wrong number** — never multiply
+   `ADMIN_SIG` by `n_occurrences` — lived in one inline table row, easy to miss. Promoted
+   to its own "`n_occurrences`: what it means, and the one rule that matters" subsection
+   in the Architecture section above.
+8. Every build logged a `UserWarning: Delete operation did not match any records` on
+   first table creation (PyIceberg's `overwrite()` internals) — harmless, but read like a
+   failure. Narrowly silenced by message text.
+9. Architecture section referred to `silver.vitals`, a name never actually used —
+   corrected to `silver.flowsheets`.
+10. Hardcoded `n_expected` row-count literals throughout `build_silver.py` are a
+    deliberate fail-loud design, not an oversight — but the reasoning and the manual
+    update procedure weren't written down anywhere. Documented in the module docstring.
+11. **No automated verification existed at all** — every check in this project was an ad
+    hoc script run by hand and eyeballed. Added `scripts/verify_silver.py`: re-derives
+    `sum(n_occurrences) == bronze row count` for all 9 applicable tables plus bespoke
+    checks for `patient_information` (including the #2 regression test), independent of
+    `build_silver.py`'s own assertions, runnable in one shot after any build.
+
+Not done as part of this review: a real test suite / CI (11 only added one verification
+script, not full test infrastructure), and a from-scratch pipeline re-run (bronze →
+silver → verify) to confirm the whole thing reproduces end to end after all of the above.
+
 ## Silver-layer design checklist
 
 Organized by table, each item tagged with which data-quality dimension it belongs to
@@ -851,13 +941,14 @@ deliberately out of scope for this checklist — those get designed per model, n
       `flowsheets.FLO_NAME`/`UNITS` (unbuilt table, massive scale) still needs this pass
       whenever that table gets built.
 
-**`patient_information`:** — **implemented in `scripts/build_silver.py::build_patient_information`, 2026-08-23.**
+**`patient_information`:** — **implemented in `scripts/build_silver.py::build_patient_information`, 2026-08-23, phantom-row fix applied 2026-08-27.**
 - [x] *[dedup]* 1,374 excess rows on `LOG_ID` resolved. Row content was inspected: 1,364
       were exact duplicates (trivial `SELECT DISTINCT`) plus 4 whitespace/wording-only
       variants (collapse the same way after normalizing). Of the remaining 7 genuinely
-      divergent `LOG_ID`s: **3 are real collisions** between different patients (`MRN`
-      and every other column differ) — both rows kept, flagged `log_id_collision`,
-      **`LOG_ID` is not a unique key for these 6 rows**; **1 is an `MRN`-corruption
+      divergent `LOG_ID`s: **1 is a phantom row, dropped entirely before classification**
+      (see the correction below); **2 are real collisions** between different patients
+      (`MRN` and every other column differ) — both rows kept, flagged `log_id_collision`,
+      **`LOG_ID` is not a unique key for these 4 rows**; **1 is an `MRN`-corruption
       artifact** (`MRN` differs but everything else is identical, and both `MRN` values
       are the scientific-notation kind) — collapsed to 1 row, flagged `mrn_corrupt`;
       **3 are genuine same-encounter conflicting values** (e.g. `DISCH_DISP_C` 15 vs 20,
@@ -867,18 +958,23 @@ deliberately out of scope for this checklist — those get designed per model, n
       value with no recovery mechanism — the reviewer caught that this was the same
       category of mistake as the `patient_medications` dose-loss issue, just far smaller
       in scope (3 of 64,357 rows). Now treated the same as `log_id_collision`: `LOG_ID`
-      is not a unique key for these 6 rows either. Verified in production output: 64,360
-      rows / 64,354 distinct `LOG_ID` (matches the paper exactly), `mrn_corrupt`=37,
-      `log_id_collision`=6, `has_conflicting_duplicate`=6.
-  - [ ] *[correction, open]* Of the 3 `log_id_collision` cases, only 2
+      is not a unique key for these 6 rows either. **Current production numbers (after
+      the phantom-row fix below): 64,359 rows / 64,354 distinct `LOG_ID`** (matches the
+      paper exactly), `mrn_corrupt`=37, `log_id_collision`=4, `has_conflicting_duplicate`=6.
+  - [x] *[correction, fixed 2026-08-27]* Of the 3 `log_id_collision` cases, only 2
         (`ebfbb4fcfd39fdff`/`c468eb4fb4f54ddb`) are genuine cross-patient collisions —
         confirmed via independent clinical data (real flowsheets for both `MRN`s). The
         3rd, `0c6b137659f5df02`, is a partial-duplication artifact, not a real second
         patient — its second `MRN` has zero footprint in any encounter-level table. See
         "LOG_ID collisions across different patients" above for the full investigation.
-        **Fix not yet applied**: `build_silver.py` should drop `0c6b137659f5df02`'s
-        `fc63c830038a1f83` row and keep only `18d889ebcda81db9`, dropping
-        `log_id_collision` from 6 rows to 4 and total silver rows from 64,357 to 64,356.
+        **This was diagnosed and the fix specified on 2026-08-27, then shipped unfixed
+        for several more silver builds and one full supervisor review before a
+        data-engineering review caught it still present.** Fixed now: `_PATIENT_INFORMATION_SQL`
+        drops `0c6b137659f5df02`'s `fc63c830038a1f83` row before classification, keeping
+        only `18d889ebcda81db9`. Verified in production output: `log_id_collision`
+        dropped from 6 rows to 4, total silver rows from 64,360 to 64,359, distinct
+        `LOG_ID` unchanged at 64,354. `scripts/verify_silver.py` now checks for this
+        specific row as a standing regression test.
 - [x] *[accuracy/join]* `mrn_corrupt` boolean flag added, not repaired. 37 rows flagged
       (38 minus the 1 collapsed by the dedup rule above). Any patient-level grouping/join
       downstream must filter or otherwise account for these rows — see "MRN corruption
@@ -1130,10 +1226,10 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       by design (same measurement reused across care-unit templates) — carried through
       to silver unchanged, no fix needed. Same for the 0.26% rows with neither
       `MEAS_VALUE_NUM` nor `MEAS_VALUE_TXT` populated (normal sparse EHR grid behavior).
-- [ ] *[open]* Unlike bronze, `silver.flowsheets` has no partition spec (matches the
-      other 6 built silver tables, none of which are partitioned) — at 659M rows this
-      may hurt query performance for anything that filters by year. Not addressed here;
-      revisit if it becomes a real bottleneck rather than pre-optimizing.
+- [x] *[fixed 2026-08-27]* `silver.flowsheets` had no partition spec, unlike bronze —
+      caught by the data-engineering review below. Reinstated (`RECORDED_TIME`, year
+      transform, matching bronze exactly) via `silver_schemas.py::partition_spec_for()`;
+      table dropped and rebuilt to apply it.
 
 ## Open items / TODO
 
@@ -1146,17 +1242,24 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       to the paper's 11 complication classes — confirmed, see `patient_post_op_complications`
       section above (11 of 12 values match the paper's Table 4 almost exactly; the 12th is
       a generic AQI reporting flag, not a class)
-- [ ] Design silver layer — see "Silver-layer design checklist" above for the full,
+- [x] Design silver layer — see "Silver-layer design checklist" above for the full,
       per-table breakdown (dedup, missingness, standardization, validity, sentinel,
       semantic corrections)
-- [ ] Run the duplicate-row audit across all remaining bronze tables — see "Duplicate-row
-      audit" section above. `patient_lda` already confirmed at 22.9% duplicated; every
-      other table still needs checking before silver dedup logic is designed
-- [ ] Scan the other nine tables for the same `MRN` scientific-notation corruption found
+- [x] Run the duplicate-row audit across all remaining bronze tables — see "Duplicate-row
+      audit" section above. Completed 2026-08-27, all 10 tables checked
+- [x] Scan the other nine tables for the same `MRN` scientific-notation corruption found
       in `patient_information` — see "MRN corruption and patient-level linkage" above.
-      Also determine whether `patient_history` / `patient_visit` (lowercase `mrn`) carry
-      `LOG_ID` at all, since MRN-keyed-only tables are unreachable for the 26 affected
-      patients the way `patient_coding` already is
+      Confirmed affecting 5 of 10 tables; `patient_history`/`patient_visit` (lowercase
+      `mrn`, since renamed to `MRN` in silver) confirmed clean
+- [x] Build all 10 silver tables — done 2026-08-27, see `docs/BUILD_LOG.md` for the
+      per-table build history. Run `python scripts/build_silver.py --all` to reproduce,
+      then `python scripts/verify_silver.py` to independently re-check the result
+- [ ] Data-engineering review of the finished silver layer (2026-08-27) — partitioning
+      reinstated, a known-but-unapplied bug fix (the `patient_information` phantom row)
+      actually applied, schema-migration/exception handling hardened, a real verification
+      script added. See `scripts/verify_silver.py` and the per-table checklist above for
+      what changed; not yet re-run against a from-scratch bronze rebuild to confirm the
+      whole pipeline still reproduces end to end.
 - [ ] Design gold-layer feature tables once a specific ML question is chosen (see
       candidate directions in project memory / earlier conversation — real-time
       intraoperative deterioration prediction was the favored direction)

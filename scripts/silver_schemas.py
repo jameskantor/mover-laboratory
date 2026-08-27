@@ -28,6 +28,34 @@ def _schema(fields):
     return Schema(*out)
 
 
+# Bronze partitions its three large time-series tables by year (see schemas.py) so query
+# engines can prune irrelevant files; that partitioning was silently dropped when silver
+# was originally written (data-engineering review, 2026-08-27) -- reinstated here on the
+# same three tables, same source column, same transform. Looked up by column name via
+# Schema.find_field() rather than a hardcoded field id, so this stays correct if a
+# table's column order ever changes.
+SILVER_PARTITION_COLUMNS = {
+    "flowsheets": ("RECORDED_TIME", "recorded_year"),
+    "patient_labs": ("Collection_Datetime", "collection_year"),
+    "patient_medications": ("MED_ACTION_TIME", "med_action_year"),
+}
+
+
+def partition_spec_for(table_key):
+    """Returns the silver PartitionSpec for table_key, or None for tables with no time
+    dimension worth partitioning on (everything outside SILVER_PARTITION_COLUMNS)."""
+    if table_key not in SILVER_PARTITION_COLUMNS:
+        return None
+    from pyiceberg.partitioning import PartitionSpec, PartitionField
+    from pyiceberg.transforms import YearTransform
+
+    col_name, partition_name = SILVER_PARTITION_COLUMNS[table_key]
+    source_id = SILVER_TABLES[table_key].find_field(col_name).field_id
+    return PartitionSpec(PartitionField(
+        source_id=source_id, field_id=1000, transform=YearTransform(), name=partition_name,
+    ))
+
+
 # Each silver table is fully recomputed from bronze on every build run (not appended
 # incrementally like bronze ingestion) -- see docs/DATA_DICTIONARY.md's "Silver-layer
 # design checklist" for the per-column rationale behind every transform.
