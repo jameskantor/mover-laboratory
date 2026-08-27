@@ -9,11 +9,16 @@ import pandas as pd
 import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).parent))
-from catalog import get_catalog
+from catalog import get_catalog, WAREHOUSE_DIR
 from schemas import TABLES
 
 DATA_DIR = Path("/work/EMR/EPIC_EMR")
-STATUS_PATH = Path("/work/iceberg_warehouse/_ingestion_status.json")
+# Was hardcoded to /work/iceberg_warehouse regardless of MOVER_WAREHOUSE_DIR (found
+# during the from-scratch reproduction run, data-engineering review) -- pointing
+# ingestion at a scratch warehouse location silently no-opped, since it read the LIVE
+# warehouse's "already done" status and skipped every table. Now derived from the same
+# WAREHOUSE_DIR catalog.py already uses, so a scratch run gets its own fresh status.
+STATUS_PATH = WAREHOUSE_DIR / "_ingestion_status.json"
 LOG_DIR = Path("/work/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 

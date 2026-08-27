@@ -8,7 +8,8 @@ RUN pip install --no-cache-dir \
     "dask[dataframe]" \
     jupyterlab \
     matplotlib \
-    seaborn
+    seaborn \
+    pytest
 
 # DuckDB's UI extension shells out to xdg-open to launch a browser; this image has no
 # browser and no xdg-open, so it crashes with an unhandled exception. Stub it out as a
