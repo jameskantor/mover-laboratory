@@ -594,7 +594,7 @@ already flagged.
 | `patient_post_op_complications` | **Confirmed and investigated (2026-08-27) — real, dedup implemented** | 79% of rows duplicated, 98% of that the generic `AN AQI POST-OP COMPLICATIONS` reporting flag (null value, up to 49×/encounter) — same re-emission-per-note mechanism as `patient_visit`. A small remainder of real complication values duplicates the same way, grep-confirmed real. Silver collapses to 84,776 rows with an `n_occurrences` count. |
 | `patient_lda` | **Confirmed — 22.9% of rows duplicated** | See above; concentrated in 5 device-type pairs, `Drain` is the generic partner in 4 of 5 |
 | `patient_procedure_events` | **Confirmed — 10.5% of rows duplicated, mixed severity** | 93.8% of duplicate groups are exact size-2 pairs (possibly legitimate one-row-per-drug charting, e.g. "Two Anti-Emetics Administered" — not yet resolved as bug vs. convention); a small number of extreme outliers ("Mark Now", up to 345 copies) look like a genuine charting glitch |
-| `patient_labs` | **Confirmed — 0.38% of rows duplicated, source-level** | 109,995 rows (54,979 groups) — verified a real example is a literal duplicate line in the raw CSV, not an ingestion bug. Small fraction relative to `patient_lda`/`patient_procedure_events` but still real. |
+| `patient_labs` | **Confirmed and investigated (2026-08-27) — dedup implemented, original scope revised** | The originally-scoped 5-column key overcounted: 86% of what it called "duplicates" were rows with a genuinely different `Reference_Range` (673 groups) or `Abnormal_Flag` (43,060 groups) — real conflicting values, not duplicates. True exact-duplicate rate on the full 9-column key is far smaller: 15,072 rows (7,536 groups, 0.05%), grep-confirmed real at the source. Silver collapses those to `n_occurrences`, leaves the conflicting-value groups untouched. |
 | `flowsheets` | **Confirmed, investigated, and dedup implemented (2026-08-27)** | 63.6% of rows duplicated (916,048,965/1,440,918,933) — by far the highest rate in the warehouse. 133,971,114 distinct groups, median size 4, max 323 (a single static field re-emitted 323 times within one encounter — not plausibly a coincidence). Concentrated in `PRE-OP`/`POST-OP` core vitals (`Pulse`, `SpO2`, `Resp`, `BP`, `MAP`, etc.); `INTRA-OP` barely affected. Since `RECORDED_TIME` is part of the exact-match tuple, this is not "same value re-charted over time" (carry-forward) — it's the literal same row appearing multiple times. Two candidate mechanisms, neither confirmed: an export process re-emitting the full unchanged flowsheet state on every subsequent save event, or device-integrated vitals (bedside monitor → Epic) getting duplicated on retry without a dedup key. No public MOVER documentation of this found despite searching. Dedup applied regardless of unconfirmed root cause — see `build_silver.py::build_flowsheets` and "Silver-layer design checklist" below. |
 
 ## MRN corruption and patient-level linkage
@@ -1052,18 +1052,36 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       (12.6% of encounters) is legitimate charting lag, confirmed by the user — leave as
       real data, don't "fix."
 
-**`patient_labs`:**
-- [ ] *[dedup]* Collapse the 0.38% exact duplicates (confirmed literal duplicate lines
-      in the raw source CSV).
+**`patient_labs`:** — **dedup implemented in `scripts/build_silver.py::build_patient_labs`, 2026-08-27.**
+- [x] *[dedup]* The originally-scoped narrow 5-column key (`LOG_ID, MRN, Lab_Code,
+      Observation_Value, Collection_Datetime`) was investigated before implementing and
+      **rejected** — 86% of the "duplicate" groups it would produce actually diverge on
+      columns it ignores: **673 groups** with a genuinely different `Reference_Range`
+      (e.g. one Potassium 4.10 result reported against two different reference ranges —
+      a real conflicting value, not a notation variant) and **43,060 groups** where
+      `Abnormal_Flag` is `NULL` on one row and computed/filled on the other (the flag
+      being derived a moment after the result posts, not a duplicate). Collapsing on the
+      narrow key would have silently merged both categories into one row — the same
+      class of mistake caught in `patient_medications`. Correct key is the **full
+      9-column exact match** (excludes only ingestion metadata): **7,536 groups /
+      15,072 rows (0.05% of the table)** are true exact duplicates, grep-confirmed as
+      literal duplicate lines in the raw source CSV, not an ingestion bug. Collapsed to
+      one row per group, repeat count kept as `n_occurrences`; the 673 `Reference_Range`
+      conflicts and 43,060 `Abnormal_Flag` completions are left as separate rows,
+      untouched — collapsing either would discard real information. Verified in
+      production output: 29,071,808 rows (from 29,079,344 bronze),
+      `sum(n_occurrences)` matches the bronze row count exactly, a known
+      `Measurement_Units`-notation-variant pair (`THOUS/MCL` vs `THOUS/ CU MM`, same
+      Platelets result) correctly remains two rows.
 - [ ] *[sentinel]* The `9999999.0` sentinel (13.7% of all rows) needs a derived
       `is_sentinel`/result-type column, not numeric treatment — it spans 3 different
       mechanisms (pure-qualitative tests, a small stable censored-value minority, and
       tests genuinely split between qualitative-screen/quantitative-confirmatory
-      reporting) that may need different downstream handling.
+      reporting) that may need different downstream handling. Not yet applied to silver.
 - [ ] *[standardization]* `Abnormal_Flag` has 5 real values (N/L/H/LL/HH), not the 3 the
       docs describe — make sure all 5 are handled, not just N/L/H.
 - [ ] *[cleanup]* `ENC_TYPE_NM` is constant (1 distinct value) — zero information,
-      candidate to drop rather than carry forward.
+      candidate to drop rather than carry forward. Carried through to silver unchanged.
 
 **`flowsheets`** (biggest table, biggest silver impact) — **implemented in `scripts/build_silver.py::build_flowsheets`, 2026-08-27.**
 - [x] *[dedup]* Collapsed the 63.6% duplication (916M/1.44B rows) to 1 row per exact

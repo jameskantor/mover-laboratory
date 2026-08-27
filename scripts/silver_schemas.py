@@ -243,4 +243,34 @@ SILVER_TABLES = {
         ("n_occurrences", LongType(), True),
         ("_silver_built_at", TimestampType(), True),
     ]),
+
+    "patient_labs": _schema([
+        ("LOG_ID", StringType(), True),
+        ("MRN", StringType(), True),
+        ("ENC_TYPE_NM", StringType(), False),
+        ("Lab_Code", StringType(), False),
+        ("Lab_Name", StringType(), False),
+        ("Observation_Value", DoubleType(), False),
+        ("Measurement_Units", StringType(), False),
+        ("Reference_Range", StringType(), False),
+        ("Abnormal_Flag", StringType(), False),
+        ("Collection_Datetime", TimestampType(), False),
+        # A narrow 5-column key (LOG_ID, MRN, Lab_Code, Observation_Value,
+        # Collection_Datetime) was considered and rejected: 86% of the "duplicate" groups
+        # it would produce actually diverge on columns it ignores -- 673 groups with a
+        # genuinely different Reference_Range (e.g. Potassium 4.10 reported against two
+        # different reference ranges) and 43,060 groups where Abnormal_Flag is NULL on one
+        # row and computed/filled on the other (the flag being derived a moment after the
+        # result, not a duplicate). Collapsing on the narrow key would have silently merged
+        # both into one row, the same category of mistake caught in patient_medications.
+        # Correct key is the full 9-column exact match (excludes ingestion metadata only):
+        # 7,536 groups / 15,072 rows (0.05% of the table) are true exact duplicates,
+        # grep-confirmed literal duplicate lines in the raw source CSV, not an ingestion
+        # bug. Collapsed to one row per group, repeat count kept as n_occurrences; the
+        # 673 Reference_Range conflicts and 43,060 Abnormal_Flag completions are left as
+        # separate rows, untouched -- collapsing either would discard real information.
+        # Collapses 29,079,344 bronze rows to 29,071,808 distinct groups.
+        ("n_occurrences", LongType(), True),
+        ("_silver_built_at", TimestampType(), True),
+    ]),
 }

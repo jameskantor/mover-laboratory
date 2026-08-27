@@ -592,6 +592,51 @@ def build_flowsheets(catalog):
              f"matches bronze exactly")
 
 
+# --- patient_labs -------------------------------------------------------------------------
+# Dedup rule (see DATA_DICTIONARY.md "Silver-layer design checklist" -> patient_labs): a
+# narrow 5-column key (LOG_ID, MRN, Lab_Code, Observation_Value, Collection_Datetime) was
+# considered and rejected -- 86% of the "duplicate" groups it would produce actually diverge
+# on columns it ignores: 673 groups with a genuinely different Reference_Range (e.g.
+# Potassium 4.10 reported against two different reference ranges -- a real conflicting
+# value, not a typo) and 43,060 groups where Abnormal_Flag is NULL on one row and
+# computed/filled on the other (the flag being derived a moment after the result, not a
+# duplicate). Collapsing on the narrow key would have silently merged both into one row --
+# the same category of mistake caught in patient_medications. Correct key is the full
+# 9-column exact match (excludes only _source_file/_ingested_at): 7,536 groups / 15,072
+# rows (0.05% of the table) are true exact duplicates, grep-confirmed as literal duplicate
+# lines in the raw source CSV, not an ingestion bug. Collapsed to one row per group, repeat
+# count kept as n_occurrences; the 673 Reference_Range conflicts and 43,060 Abnormal_Flag
+# completions are deliberately left as separate rows, untouched.
+_PATIENT_LABS_COLS = [
+    "LOG_ID", "MRN", "ENC_TYPE_NM", "Lab_Code", "Lab_Name", "Observation_Value",
+    "Measurement_Units", "Reference_Range", "Abnormal_Flag", "Collection_Datetime",
+]
+_PATIENT_LABS_SQL = """
+SELECT {cols}, count(*) AS n_occurrences
+FROM read_parquet({{files}})
+GROUP BY {cols}
+""".format(cols=", ".join(_PATIENT_LABS_COLS))
+
+
+def build_patient_labs(catalog):
+    files = bronze_files(catalog, "patient_labs")
+    con = duckdb.connect()
+    df = con.execute(_PATIENT_LABS_SQL.format(files=files)).fetchdf()
+    df["_silver_built_at"] = datetime.now(timezone.utc)
+
+    n_bronze = con.execute(f"SELECT count(*) FROM read_parquet({files})").fetchone()[0]
+    n_expected = 29071808  # distinct group count, verified by hand
+    if len(df) != n_expected:
+        raise AssertionError(
+            f"patient_labs: expected {n_expected:,} distinct groups, got {len(df):,} "
+            "-- dedup logic no longer matches the validated shape, stopping before write."
+        )
+    log.info(f"[patient_labs] {len(df):,} rows (from {n_bronze:,} bronze), "
+             f"max n_occurrences={df['n_occurrences'].max()}")
+
+    write_silver_table(catalog, "patient_labs", df)
+
+
 BUILDERS = {
     "patient_information": build_patient_information,
     "patient_lda": build_patient_lda,
@@ -601,6 +646,7 @@ BUILDERS = {
     "patient_medications": build_patient_medications,
     "patient_post_op_complications": build_patient_post_op_complications,
     "flowsheets": build_flowsheets,
+    "patient_labs": build_patient_labs,
 }
 
 

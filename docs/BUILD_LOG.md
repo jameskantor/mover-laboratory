@@ -730,3 +730,33 @@ static field re-emitted 323 times within one encounter) collapses to exactly
 `flowsheets`. `patient_labs` (0.38% exact duplicates, confirmed real, dedup rule already
 scoped) and `patient_procedure_events` (dedup rule still unresolved — bug vs. legitimate
 one-row-per-item charting convention, open since 2026-08-21) are the two tables left.
+
+## 2026-08-27 — Silver build: `patient_labs` done, original dedup scope revised
+
+Picked up `patient_labs` where the earlier column audit had left it — a narrow 5-column
+key (`LOG_ID, MRN, Lab_Code, Observation_Value, Collection_Datetime`) had been scoped as
+"the" dedup rule based on a 0.38%/109,995-row estimate. Checked it before implementing
+blind, per the standing rule to explain the theory and get approval first: the narrow
+key turned out to be unsafe. **86% of the groups it would flag as duplicates actually
+diverge on columns it ignores** — 673 groups where `Reference_Range` genuinely differs
+(e.g. one Potassium 4.10 result reported against two different reference ranges — a real
+conflicting value, not a rounding/notation issue) and 43,060 groups where
+`Abnormal_Flag` is `NULL` on one row and computed/filled on the other (the flag being
+derived a moment after the result posts, not a duplicate). Collapsing on the narrow key
+would have silently merged both categories into one row and thrown away real
+information — the same class of mistake caught earlier in `patient_medications`.
+
+Correctly re-scoped to the full 9-column exact match (every real column except
+ingestion metadata): the true duplicate rate is **7,536 groups / 15,072 rows — 0.05% of
+the table**, far smaller than the original estimate. Grep-confirmed a real example
+(a `Measurement_Units` notation-variant pair, `THOUS/MCL` vs `THOUS/ CU MM`, same
+Platelets result) as literal duplicate lines in the raw source CSV before trusting it.
+
+`build_patient_labs` in `scripts/build_silver.py` collapses on the full 9-column key,
+repeat count kept as `n_occurrences`; the 673 `Reference_Range` conflicts and 43,060
+`Abnormal_Flag` completions are deliberately left as separate rows, untouched.
+Production run: 29,071,808 rows (from 29,079,344 bronze), `sum(n_occurrences)` matches
+bronze exactly, the cited `Measurement_Units` conflict correctly remains two rows.
+
+Only `patient_procedure_events` is left — dedup rule still unresolved (bug vs. legitimate
+one-row-per-item charting convention, open since 2026-08-21).
