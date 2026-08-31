@@ -46,13 +46,13 @@ Every dedup/cleaning decision, per table, is in `docs/DATA_DICTIONARY.md`'s
 "Silver-layer design checklist"; the build history (including two real mistakes caught
 and fixed along the way) is in `docs/BUILD_LOG.md`.
 
-**Gold: not started.** Build is deliberately deferred until a specific ML question is
-chosen. `docs/GOLD_USE_CASES.md` is the research meant to inform that choice — a
+**Gold: research phase, build not started.** `docs/GOLD_USE_CASES.md` is a
 literature-grounded, independently fact-checked survey of 18 candidate use cases (mortality,
 AKI, deterioration/early-warning, sepsis, transfusion, OR scheduling, and more) mapped to
 this dataset's actual bronze/silver schema, with real production precedent cited for each
-category. It's input to the decision, not the decision — no use case has been selected yet.
-See `docs/DATA_DICTIONARY.md` → "Open items" for the standing pointer.
+category. That survey is input to picking a specific ML question — no use case has been
+selected and no gold table build has started yet. See `docs/DATA_DICTIONARY.md` → "Open
+items" for the standing pointer.
 
 ## Data sources
 
