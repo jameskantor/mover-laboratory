@@ -1262,4 +1262,7 @@ but is encounter-level via `LOG_ID`) — **dedup implemented in
       whole pipeline still reproduces end to end.
 - [ ] Design gold-layer feature tables once a specific ML question is chosen (see
       candidate directions in project memory / earlier conversation — real-time
-      intraoperative deterioration prediction was the favored direction)
+      intraoperative deterioration prediction was the favored direction). See
+      `docs/GOLD_USE_CASES.md` (2026-08-31) for a literature-grounded, independently
+      fact-checked survey of 18 candidate use cases mapped to this schema — no use case
+      selected yet, that file is the input to this decision, not the decision itself.
